@@ -28,41 +28,55 @@ class ESPNScoreService {
       'Iowa State':'Iowa State','Iowa St':'Iowa State','Alabama':'Alabama',
       'Michigan State':'Michigan State','Michigan St':'Michigan State',
       'Gonzaga':'Gonzaga','Virginia':'Virginia','Illinois':'Illinois',
-      'North Carolina':'North Carolina','Kentucky':'Kentucky','Tennessee':'Tennessee',
+      'North Carolina':'North Carolina','UNC':'North Carolina',
+      'Kentucky':'Kentucky','Tennessee':'Tennessee',
       'Arkansas':'Arkansas','BYU':'BYU','Louisville':'Louisville',
       'Wisconsin':'Wisconsin','UCLA':'UCLA',
       'Ohio State':'Ohio State','Ohio St':'Ohio State',
       'TCU':'TCU','Texas Tech':'Texas Tech','Nebraska':'Nebraska',
       'Vanderbilt':'Vanderbilt','Clemson':'Clemson','Iowa':'Iowa',
-      'Georgia':'Georgia','Missouri':'Missouri','Texas A&M':'Texas A&M',
-      "Saint Mary's":"Saint Mary's","St. Mary's":"Saint Mary's",
-      'Villanova':'Villanova',"St. John's":"St. John's",
+      'Georgia':'Georgia','Missouri':'Missouri',
+      'Texas A&M':'Texas A&M','Texas A&M Aggies':'Texas A&M',
+      "Saint Mary's":"Saint Mary's","St. Mary's":"Saint Mary's","Saint Mary's (CA)":"Saint Mary's",
+      'Villanova':'Villanova',"St. John's":"St. John's","St. John's (NY)":"St. John's",
       'High Point':'High Point','Siena':'Siena','Troy':'Troy',
-      'South Florida':'South Florida','USF':'South Florida',
-      'McNeese':'McNeese','McNeese State':'McNeese',
-      'Cal Baptist':'Cal Baptist','California Baptist':'Cal Baptist',
-      'Northern Iowa':'Northern Iowa','UNI':'Northern Iowa',
-      'North Dakota State':'North Dakota State','North Dakota St':'North Dakota State','NDSU':'North Dakota State',
+      'South Florida':'South Florida','USF':'South Florida','S Florida':'South Florida','S. Florida':'South Florida',
+      'McNeese':'McNeese','McNeese State':'McNeese','McNeese St':'McNeese',
+      'Cal Baptist':'Cal Baptist','California Baptist':'Cal Baptist','CBU':'Cal Baptist',
+      'Northern Iowa':'Northern Iowa','UNI':'Northern Iowa','N Iowa':'Northern Iowa','N. Iowa':'Northern Iowa',
+      'North Dakota State':'North Dakota State','North Dakota St':'North Dakota State',
+      'NDSU':'North Dakota State','N Dakota St':'North Dakota State','N. Dakota St':'North Dakota State',
+      'N. Dakota St.':'North Dakota State','ND State':'North Dakota State',
       'VCU':'VCU','Howard':'Howard','Idaho':'Idaho',
       'Penn':'Penn','Pennsylvania':'Penn',
-      'Hawaii':'Hawaii',"Hawai'i":'Hawaii',
+      'Hawaii':'Hawaii',"Hawai'i":'Hawaii',"Hawai\'i":'Hawaii',
       'Kennesaw State':'Kennesaw State','Kennesaw St':'Kennesaw State',
-      'Saint Louis':'Saint Louis','St. Louis':'Saint Louis',
-      'Texas':'Texas','NC State':'NC State',
-      'Miami':'Miami (FL)','SMU':'SMU',
-      'UMBC':'UMBC','Prairie View A&M':'Prairie View A&M','Lehigh':'Lehigh',
-      'LIU':'LIU','Long Island':'LIU','Long Island University':'LIU',
+      'Saint Louis':'Saint Louis','St. Louis':'Saint Louis','SLU':'Saint Louis',
+      'Texas':'Texas','NC State':'NC State','N.C. State':'NC State',
+      'Miami':'Miami (FL)','Miami FL':'Miami (FL)','Miami (FL)':'Miami (FL)',
+      'Miami Ohio':'Miami (OH)','Miami (OH)':'Miami (OH)',
+      'SMU':'SMU','UMBC':'UMBC',
+      'Prairie View A&M':'Prairie View A&M','Prairie View':'Prairie View A&M',
+      'Lehigh':'Lehigh',
+      'LIU':'LIU','Long Island':'LIU','Long Island University':'LIU','LIU Brooklyn':'LIU',
       'Utah State':'Utah State','Utah St':'Utah State',
-      'Queens':'Queens','Akron':'Akron','Hofstra':'Hofstra',
+      'Queens':'Queens','Queens (NC)':'Queens',
+      'Akron':'Akron','Hofstra':'Hofstra',
       'Wright State':'Wright State','Wright St':'Wright State',
       'Santa Clara':'Santa Clara',
-      'Tennessee State':'Tennessee State','Tennessee St':'Tennessee State',
-      'UCF':'UCF','Furman':'Furman','N. Iowa':'Northern Iowa',
+      'Tennessee State':'Tennessee State','Tennessee St':'Tennessee State','Tenn St':'Tennessee State',
+      'UCF':'UCF','Furman':'Furman',
     };
     if (map[espnName]) return map[espnName];
     var keys = Object.keys(map);
     for (var i = 0; i < keys.length; i++) {
       if (espnName.toLowerCase() === keys[i].toLowerCase()) return map[keys[i]];
+    }
+    // Fallback: try removing common suffixes
+    var stripped = espnName.replace(/ (Wildcats|Blue Devils|Wolverines|Gators|Huskies|Jayhawks|Boilermakers|Cougars|Cyclones|Crimson Tide|Spartans|Bulldogs|Cavaliers|Fighting Illini|Tar Heels|Volunteers|Razorbacks|Cardinals|Badgers|Bruins|Buckeyes|Horned Frogs|Red Raiders|Cornhuskers|Commodores|Tigers|Hawkeyes|Aggies|Gaels|Panthers|Hurricanes|Rams|Billikens|Bison|Bears|Cowboys|Mountaineers|Bearcats|Friars|Hoyas|Ducks|Beavers|Demon Deacons|Yellow Jackets|Wolfpack|Seminoles|Longhorns|Sooners|Mustangs|Owls|Quakers)$/i, '');
+    if (map[stripped]) return map[stripped];
+    for (var j = 0; j < keys.length; j++) {
+      if (stripped.toLowerCase() === keys[j].toLowerCase()) return map[keys[j]];
     }
     return espnName;
   }
