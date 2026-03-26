@@ -317,6 +317,7 @@ router.post('/admin/advance-bracket', async (req, res) => {
 // ESPN SCORE SYNC
 // ═══════════════════════════════════════════════════════════════
 const ESPNScoreService = require('./espnScoreService');
+const RoundAdvancer = require('./advanceRounds');
 
 router.get('/admin/espn-sync', async (req, res) => {
   try {
@@ -325,7 +326,11 @@ router.get('/admin/espn-sync', async (req, res) => {
     if (scoreResult.updated > 0) {
       pickResult = await ESPNScoreService.scorePicks('00000000-0000-0000-0000-000000002026');
     }
-    res.json({ message: 'ESPN sync complete', scores: scoreResult, picks: pickResult });
+    // Auto-advance rounds if all games in current round are final
+    const advanceResult = await RoundAdvancer.checkAndAdvance();
+    console.log('[ADVANCE]', advanceResult.log.join(', '));
+
+    res.json({ message: 'ESPN sync complete', advance: advanceResult, scores: scoreResult, picks: pickResult });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
