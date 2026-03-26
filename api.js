@@ -318,6 +318,7 @@ router.post('/admin/advance-bracket', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 const ESPNScoreService = require('./espnScoreService');
 const RoundAdvancer = require('./advanceRounds');
+const EmailReminder = require('./emailReminder');
 
 router.get('/admin/espn-sync', async (req, res) => {
   try {
@@ -345,6 +346,20 @@ router.post('/admin/espn-sync', async (req, res) => {
     }
     res.json({ message: 'ESPN sync complete', scores: scoreResult, picks: pickResult });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ═══════════════════════════════════════════
+// Send pick reminders to users without picks
+// ═══════════════════════════════════════════
+router.get('/admin/send-reminders', async (req, res) => {
+  try {
+    const result = await EmailReminder.sendPickReminders();
+    res.json({ message: 'Reminders processed', ...result });
+  } catch (err) {
+    console.error('[REMINDER ERROR]', err);
     res.status(500).json({ error: err.message });
   }
 });
