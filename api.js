@@ -364,4 +364,14 @@ router.get('/admin/send-reminders', async (req, res) => {
   }
 });
 
+
+router.get("/admin/send-reminders", async (req, res) => {
+  try {
+    const result = await EmailReminder.sendPickReminders();
+    res.json({ message: "Reminders processed", ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
