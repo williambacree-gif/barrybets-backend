@@ -1,11 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { createClient } = require('@supabase/supabase-js');
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+const { supabaseAdmin: supabase } = require('./supabase');
 
 const PICKS_LOCK = new Date('2026-04-09T12:00:00Z');
 const MISSED_CUT_STROKES = 80;
