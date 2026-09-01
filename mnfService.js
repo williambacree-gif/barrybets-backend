@@ -196,7 +196,7 @@ class MNFService {
    * Runs Wednesday morning. Will not overwrite an already-frozen number —
    * that is the whole point of freezing it.
    */
-  static async freezeSpreads(seasonId, { force = false, week = null } = {}) {
+  static async freezeSpreads(seasonId, { force = false, week = null, windowDays = 7 } = {}) {
     let q = supabaseAdmin
       .from('mnf_games')
       .select('id, week_no, home_team, away_team, kickoff_at, spread_frozen_at')
@@ -207,8 +207,19 @@ class MNFService {
     const { data: games, error } = await q;
     if (error) throw error;
 
-    const pending = (games || []).filter(g => force || !g.spread_frozen_at);
-    if (!pending.length) return { frozen: 0, message: 'Nothing to freeze' };
+    // Only freeze the game that is actually coming up. Without this the first
+    // Wednesday run would grab every remaining week at once — locking January's
+    // line in September, months before the books mean anything by it.
+    const now = Date.now();
+    const horizon = now + windowDays * 24 * 60 * 60 * 1000;
+
+    const pending = (games || []).filter(g => {
+      if (!force && g.spread_frozen_at) return false;
+      if (week) return true;                       // explicit week overrides the window
+      const kick = new Date(g.kickoff_at).getTime();
+      return kick >= now && kick <= horizon;
+    });
+    if (!pending.length) return { frozen: 0, message: 'No game inside the freeze window' };
 
     const odds = await this.fetchSpreads();
     if (!odds.length) return { frozen: 0, message: 'No odds returned' };
