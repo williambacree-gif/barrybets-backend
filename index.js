@@ -10,6 +10,8 @@ const ESPNScoreService = require('./espnScoreService');
 const mastersRoutes = require('./mastersRoutes');
 const mnfRoutes = require('./mnfRoutes');
 const MNFService = require('./mnfService');
+const cfbRoutes = require('./cfbRoutes');
+const CFBService = require('./cfbService');
 const { supabaseAdmin } = require('./supabase');
 
 const app = express();
@@ -25,6 +27,7 @@ app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
 app.use('/api', apiRoutes);
 app.use('/api/masters', mastersRoutes);
 app.use('/api/mnf', mnfRoutes);
+app.use('/api/cfb', cfbRoutes);
 
 app.get('/api/health', (req, res) => {
     res.json({ status: 'alive', app: 'Barry Bets', timestamp: new Date().toISOString() });
@@ -35,81 +38,118 @@ app.get('/api/health', (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 cron.schedule('*/5 11-23 * 3-4 *', async () => {
-    console.log('[Cron] Checking ESPN for scores...');
     try {
-        const scoreResult = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
-        if (scoreResult.updated > 0) {
-            console.log('[Cron] Updated ' + scoreResult.updated + ' scores');
-            const pickResult = await ESPNScoreService.scorePicks(TOURNAMENT_ID);
-            console.log('[Cron] Scored ' + pickResult.scored + ' picks');
-        }
-    } catch (err) { console.error('[Cron] Score sync failed:', err.message); }
+        const r = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
+        if (r.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
+    } catch (err) { console.error('[Cron] MM sync failed:', err.message); }
 });
 
 cron.schedule('*/5 0-1 * 3-4 *', async () => {
     try {
-        const scoreResult = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
-        if (scoreResult.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
-    } catch (err) { console.error('[Cron] Late sync failed:', err.message); }
+        const r = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
+        if (r.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
+    } catch (err) { console.error('[Cron] MM late sync failed:', err.message); }
 });
+
+// ═══════════════════════════════════════════════════════════════
+// SEASON LOOKUPS
+// ═══════════════════════════════════════════════════════════════
+
+async function activeMnfSeason() {
+    const { data } = await supabaseAdmin
+        .from('mnf_seasons').select('id, year').eq('status', 'active')
+        .order('year', { ascending: false }).limit(1).maybeSingle();
+    return data;
+}
+
+async function activeCfbSeason() {
+    const { data } = await supabaseAdmin
+        .from('cfb_seasons').select('id, year').eq('status', 'active')
+        .order('year', { ascending: false }).limit(1).maybeSingle();
+    return data;
+}
+
+async function cfbCurrentWeek(seasonId) {
+    const { data: pending } = await supabaseAdmin
+        .from('cfb_games').select('pool_week').eq('season_id', seasonId)
+        .neq('status', 'final').order('pool_week').limit(1).maybeSingle();
+    return pending ? pending.pool_week : null;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // MONDAY NIGHT FOOTBALL
 // ═══════════════════════════════════════════════════════════════
 
-async function activeMnfSeason() {
-    const { data } = await supabaseAdmin
-        .from('mnf_seasons').select('id, year')
-        .eq('status', 'active').order('year', { ascending: false })
-        .limit(1).maybeSingle();
-    return data;
-}
-
-// Freeze the spread Wednesday 9:00 AM ET. This is the number that grades
-// the week — once written it is never overwritten.
+// Freeze the line Wednesday 9:00 AM ET — only for the game inside the
+// next seven days, never the whole rest of the season.
 cron.schedule('0 9 * * 3', async () => {
     try {
-        const season = await activeMnfSeason();
-        if (!season) return;
-        const result = await MNFService.freezeSpreads(season.id);
-        console.log('[MNF Cron] Freeze:', JSON.stringify(result));
+        const s = await activeMnfSeason();
+        if (s) console.log('[MNF Cron] Freeze:', JSON.stringify(await MNFService.freezeSpreads(s.id)));
     } catch (err) { console.error('[MNF Cron] Freeze failed:', err.message); }
 }, ET);
 
-// Retries, in case the books had not posted a line at 9am.
 cron.schedule('0 13 * * 3', async () => {
-    try {
-        const season = await activeMnfSeason();
-        if (season) await MNFService.freezeSpreads(season.id);
-    } catch (err) { console.error('[MNF Cron] Freeze retry failed:', err.message); }
+    try { const s = await activeMnfSeason(); if (s) await MNFService.freezeSpreads(s.id); }
+    catch (err) { console.error('[MNF Cron] Freeze retry failed:', err.message); }
 }, ET);
 
 cron.schedule('0 9 * * 4', async () => {
-    try {
-        const season = await activeMnfSeason();
-        if (season) await MNFService.freezeSpreads(season.id);
-    } catch (err) { console.error('[MNF Cron] Thursday freeze failed:', err.message); }
+    try { const s = await activeMnfSeason(); if (s) await MNFService.freezeSpreads(s.id); }
+    catch (err) { console.error('[MNF Cron] Thursday freeze failed:', err.message); }
 }, ET);
 
-// Monday night: auto-assign missed picks at kickoff, then track the score
-// and grade as soon as it goes final.
+// Monday night: auto-assign missed picks at kickoff, track the score, grade.
 cron.schedule('*/5 20-23 * * 1', async () => {
     try {
-        const season = await activeMnfSeason();
-        if (!season) return;
-        const result = await MNFService.runWeeklyPipeline(season.id);
-        if (result.graded.graded > 0 || result.assigned.assigned > 0) {
-            console.log('[MNF Cron] Pipeline:', JSON.stringify(result));
-        }
+        const s = await activeMnfSeason();
+        if (!s) return;
+        const r = await MNFService.runWeeklyPipeline(s.id);
+        if (r.graded.graded > 0 || r.assigned.assigned > 0) console.log('[MNF Cron]', JSON.stringify(r));
     } catch (err) { console.error('[MNF Cron] Monday pipeline failed:', err.message); }
 }, ET);
 
-// Games run past midnight ET.
 cron.schedule('*/5 0-1 * * 2', async () => {
+    try { const s = await activeMnfSeason(); if (s) await MNFService.runWeeklyPipeline(s.id); }
+    catch (err) { console.error('[MNF Cron] Late pipeline failed:', err.message); }
+}, ET);
+
+// ═══════════════════════════════════════════════════════════════
+// COLLEGE FOOTBALL SURVIVOR
+// ═══════════════════════════════════════════════════════════════
+
+// Rebuild the board after the new poll lands, and again Friday in case
+// of rank changes or kickoff moves.
+for (const expr of ['0 10 * * 2', '0 10 * * 5']) {
+    cron.schedule(expr, async () => {
+        try {
+            const s = await activeCfbSeason();
+            if (!s) return;
+            const wk = await cfbCurrentWeek(s.id);
+            if (wk) console.log('[CFB Cron] Sync week', wk, JSON.stringify(await CFBService.syncWeek(s.id, wk)));
+        } catch (err) { console.error('[CFB Cron] Week sync failed:', err.message); }
+    }, ET);
+}
+
+// Scores and eliminations across the college football weekend.
+cron.schedule('*/10 12-23 * * 4,5,6,0', async () => {
     try {
-        const season = await activeMnfSeason();
-        if (season) await MNFService.runWeeklyPipeline(season.id);
-    } catch (err) { console.error('[MNF Cron] Late pipeline failed:', err.message); }
+        const s = await activeCfbSeason();
+        if (!s) return;
+        const wk = await cfbCurrentWeek(s.id);
+        if (!wk) return;
+        const r = await CFBService.runWeeklyPipeline(s.id, wk);
+        if (r.graded.graded > 0) console.log('[CFB Cron]', JSON.stringify(r));
+    } catch (err) { console.error('[CFB Cron] Weekend pipeline failed:', err.message); }
+}, ET);
+
+cron.schedule('*/10 0-2 * * 5,6,0,1', async () => {
+    try {
+        const s = await activeCfbSeason();
+        if (!s) return;
+        const wk = await cfbCurrentWeek(s.id);
+        if (wk) await CFBService.runWeeklyPipeline(s.id, wk);
+    } catch (err) { console.error('[CFB Cron] Late pipeline failed:', err.message); }
 }, ET);
 
 // ═══════════════════════════════════════════════════════════════
@@ -123,17 +163,22 @@ app.listen(PORT, () => {
     console.log('Barry Bets running on port ' + PORT);
     setTimeout(async () => {
         try {
-            const result = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
-            if (result.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
+            const r = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
+            if (r.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
         } catch (err) { console.error('[Startup] MM sync failed:', err.message); }
 
         try {
-            const season = await activeMnfSeason();
-            if (season) {
-                const r = await MNFService.runWeeklyPipeline(season.id);
-                console.log('[Startup] MNF pipeline:', JSON.stringify(r));
-            }
+            const s = await activeMnfSeason();
+            if (s) console.log('[Startup] MNF:', JSON.stringify(await MNFService.runWeeklyPipeline(s.id)));
         } catch (err) { console.error('[Startup] MNF sync failed:', err.message); }
+
+        try {
+            const s = await activeCfbSeason();
+            if (s) {
+                const wk = await cfbCurrentWeek(s.id);
+                if (wk) console.log('[Startup] CFB:', JSON.stringify(await CFBService.runWeeklyPipeline(s.id, wk)));
+            }
+        } catch (err) { console.error('[Startup] CFB sync failed:', err.message); }
     }, 5000);
 });
 
