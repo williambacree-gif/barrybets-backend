@@ -192,6 +192,81 @@ class CFBService {
   }
 
   /**
+   * Every ranked team playing this week, worst rank first.
+   * #25 comes before #24, which comes before #1 — so the first entry a
+   * player hasn't burned is the weakest ranked team still available to them.
+   */
+  static rankedCandidates(games) {
+    const out = [];
+    for (const g of games) {
+      if (g.away_rank) out.push({ rank:g.away_rank, side:'away', game_id:g.id,
+                                  team_id:g.away_team_id, team:g.away_team });
+      if (g.home_rank) out.push({ rank:g.home_rank, side:'home', game_id:g.id,
+                                  team_id:g.home_team_id, team:g.home_team });
+    }
+    // Ranks can tie in ESPN's feed, so break ties by name to stay deterministic.
+    return out.sort((a, b) => b.rank - a.rank || String(a.team).localeCompare(String(b.team)));
+  }
+
+  /** The team a player gets handed if they forget to pick. */
+  static autoPickFor(games, usedTeamIds) {
+    const used = new Set(usedTeamIds || []);
+    return this.rankedCandidates(games).find(c => !used.has(c.team_id)) || null;
+  }
+
+  /**
+   * Once the board locks, hand every alive player who didn't pick the
+   * lowest-ranked Top 25 team they haven't already used.
+   */
+  static async autoAssignMissingPicks(seasonId, poolWeek) {
+    if (!(await this.isLocked(seasonId, poolWeek))) return { assigned: 0, message: 'Not locked yet' };
+
+    const { data: games } = await supabaseAdmin
+      .from('cfb_games').select('*').eq('season_id', seasonId).eq('pool_week', poolWeek);
+    if (!games || !games.length) return { assigned: 0 };
+
+    const { data: alive } = await supabaseAdmin
+      .from('cfb_players').select('id, display_name')
+      .eq('season_id', seasonId).eq('status', 'alive');
+
+    let assigned = 0, stranded = 0;
+    const log = [];
+
+    for (const player of alive || []) {
+      const { data: already } = await supabaseAdmin
+        .from('cfb_picks').select('id')
+        .eq('season_id', seasonId).eq('pool_week', poolWeek).eq('player_id', player.id).maybeSingle();
+      if (already) continue;
+
+      const { data: history } = await supabaseAdmin
+        .from('cfb_picks').select('picked_team_id')
+        .eq('season_id', seasonId).eq('player_id', player.id);
+
+      const choice = this.autoPickFor(games, (history || []).map(h => h.picked_team_id));
+
+      if (!choice) {
+        // Every ranked team this week is already burned. Nothing left to give.
+        await supabaseAdmin.from('cfb_players')
+          .update({ status: 'eliminated', eliminated_week: poolWeek }).eq('id', player.id);
+        log.push(`${player.display_name} had no unused ranked team left and is out`);
+        stranded++;
+        continue;
+      }
+
+      await supabaseAdmin.from('cfb_picks').insert({
+        season_id: seasonId, pool_week: poolWeek, player_id: player.id, game_id: choice.game_id,
+        picked_side: choice.side, picked_team: choice.team, picked_team_id: choice.team_id,
+        picked_at: new Date().toISOString(), result: 'pending', auto_assigned: true,
+      });
+      log.push(`${player.display_name} auto-assigned #${choice.rank} ${choice.team}`);
+      assigned++;
+    }
+
+    if (assigned || stranded) console.log(`[CFB] Auto-assigned ${assigned}, stranded ${stranded}`);
+    return { assigned, stranded, log };
+  }
+
+  /**
    * Grade a week: mark picks, knock out anyone who lost, and knock out
    * anyone who never picked once every game is final.
    */
@@ -284,9 +359,10 @@ class CFBService {
   }
 
   static async runWeeklyPipeline(seasonId, poolWeek) {
+    const assigned = await this.autoAssignMissingPicks(seasonId, poolWeek);
     const scores = await this.syncScores(seasonId, poolWeek);
     const graded = await this.gradeWeek(seasonId, poolWeek);
-    return { scores, graded };
+    return { assigned, scores, graded };
   }
 }
 
