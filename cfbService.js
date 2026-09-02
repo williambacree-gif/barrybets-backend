@@ -174,16 +174,22 @@ class CFBService {
       const away = comp?.competitors?.find(c => c.homeAway === 'away');
       if (!home || !away) continue;
 
-      const complete = comp.status?.type?.completed === true;
+      // Take the state from ESPN rather than inferring it from the score.
+      // ESPN reports "0" for a game that has not kicked off, so treating
+      // "has a score" as "in progress" marked every future game live at 0-0.
+      const state = comp.status?.type?.state; // 'pre' | 'in' | 'post'
+      const complete = comp.status?.type?.completed === true || state === 'post';
+      const started = state === 'in' || complete;
+
       const hs = parseInt(home.score, 10);
       const as = parseInt(away.score, 10);
-      const scored = Number.isFinite(hs) && Number.isFinite(as);
+      const scored = started && Number.isFinite(hs) && Number.isFinite(as);
 
       await supabaseAdmin.from('cfb_games').update({
         home_score: scored ? hs : null,
         away_score: scored ? as : null,
         winner_side: complete && scored ? (hs > as ? 'home' : as > hs ? 'away' : null) : null,
-        status: complete ? 'final' : (scored ? 'in_progress' : 'scheduled'),
+        status: complete ? 'final' : state === 'in' ? 'in_progress' : 'scheduled',
         updated_at: new Date().toISOString(),
       }).eq('id', g.id);
       updated++;
