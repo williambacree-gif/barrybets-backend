@@ -34,22 +34,34 @@ app.get('/api/health', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// MARCH MADNESS — unchanged, only runs in March/April
+// MARCH MADNESS — FEED TURNED OFF (Sep 2026)
+//
+// The 2026 bracket competition is over and did not work well enough
+// to run again as-is. These two crons scraped ESPN every 5 minutes
+// through March and April and graded picks off it. They are off so
+// they do not wake up next March against a stale 2026 bracket.
+//
+// The data is untouched — the tables, the 2026 tournament row and
+// every pick are all still there.
+//
+// TO TURN THE FEED BACK ON next spring: uncomment the two blocks
+// below and point TOURNAMENT_ID (top of this file) at the new
+// season's tournament row. Do not reuse the 2026 id.
 // ═══════════════════════════════════════════════════════════════
 
-cron.schedule('*/5 11-23 * 3-4 *', async () => {
-    try {
-        const r = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
-        if (r.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
-    } catch (err) { console.error('[Cron] MM sync failed:', err.message); }
-});
+// cron.schedule('*/5 11-23 * 3-4 *', async () => {
+//     try {
+//         const r = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
+//         if (r.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
+//     } catch (err) { console.error('[Cron] MM sync failed:', err.message); }
+// });
 
-cron.schedule('*/5 0-1 * 3-4 *', async () => {
-    try {
-        const r = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
-        if (r.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
-    } catch (err) { console.error('[Cron] MM late sync failed:', err.message); }
-});
+// cron.schedule('*/5 0-1 * 3-4 *', async () => {
+//     try {
+//         const r = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
+//         if (r.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
+//     } catch (err) { console.error('[Cron] MM late sync failed:', err.message); }
+// });
 
 // ═══════════════════════════════════════════════════════════════
 // SEASON LOOKUPS
@@ -162,10 +174,14 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
     console.log('Barry Bets running on port ' + PORT);
     setTimeout(async () => {
-        try {
-            const r = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
-            if (r.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
-        } catch (err) { console.error('[Startup] MM sync failed:', err.message); }
+        // March Madness startup sync — OFF (Sep 2026). This one ran on
+        // every boot, all year, not just in March. Uncomment along with
+        // the two crons above to bring the feed back next spring.
+        //
+        // try {
+        //     const r = await ESPNScoreService.syncScoresToGames(TOURNAMENT_ID);
+        //     if (r.updated > 0) await ESPNScoreService.scorePicks(TOURNAMENT_ID);
+        // } catch (err) { console.error('[Startup] MM sync failed:', err.message); }
 
         try {
             const s = await activeMnfSeason();
