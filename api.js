@@ -10,6 +10,22 @@ const { nanoid } = require('nanoid');
 const TOURNAMENT_ID = '00000000-0000-0000-0000-000000002026';
 
 // ═══════════════════════════════════════════════════════════════
+// Admin guard (added Sep 2026).
+//
+// Every /admin/* route below used to be reachable by anyone on the
+// internet with no credentials at all — they could seed or advance
+// the bracket, burn Odds API quota, or fire reminder emails at the
+// players. Same shared secret the MNF and CFB routes already use.
+// ═══════════════════════════════════════════════════════════════
+function requireAdmin(req, res, next) {
+  const expected = process.env.MNF_ADMIN_TOKEN;
+  if (!expected) return res.status(503).json({ error: 'MNF_ADMIN_TOKEN not configured' });
+  const given = req.headers['x-admin-token'] || req.query.token;
+  if (given !== expected) return res.status(403).json({ error: 'Forbidden' });
+  next();
+}
+
+// ═══════════════════════════════════════════════════════════════
 // LEAGUES
 // ═══════════════════════════════════════════════════════════════
 
@@ -275,7 +291,7 @@ router.get('/leagues/:leagueId/standings/members', requireAuth, async (req, res)
 // ADMIN (seed bracket, sync odds, score games)
 // ═══════════════════════════════════════════════════════════════
 
-router.post('/admin/seed-bracket', async (req, res) => {
+router.post('/admin/seed-bracket', requireAdmin, async (req, res) => {
   try {
     const result = await BracketSeeder.seedAll();
     res.json({ message: 'Bracket seeded', ...result });
@@ -284,7 +300,7 @@ router.post('/admin/seed-bracket', async (req, res) => {
   }
 });
 
-router.post('/admin/sync-odds', async (req, res) => {
+router.post('/admin/sync-odds', requireAdmin, async (req, res) => {
   try {
     const result = await OddsService.syncOddsToGames(TOURNAMENT_ID);
     res.json(result);
@@ -293,7 +309,7 @@ router.post('/admin/sync-odds', async (req, res) => {
   }
 });
 
-router.post('/admin/sync-scores', async (req, res) => {
+router.post('/admin/sync-scores', requireAdmin, async (req, res) => {
   try {
     await OddsService.syncScoresToGames(TOURNAMENT_ID);
     const scored = await SurvivorEngine.scoreAllPendingGames(TOURNAMENT_ID);
@@ -303,7 +319,7 @@ router.post('/admin/sync-scores', async (req, res) => {
   }
 });
 
-router.post('/admin/advance-bracket', async (req, res) => {
+router.post('/admin/advance-bracket', requireAdmin, async (req, res) => {
   try {
     const { completed_round } = req.body;
     const result = await BracketSeeder.advanceBracket(TOURNAMENT_ID, completed_round);
@@ -320,7 +336,7 @@ const ESPNScoreService = require('./espnScoreService');
 const RoundAdvancer = require('./advanceRounds');
 const EmailReminder = require('./emailReminder');
 
-router.get('/admin/espn-sync', async (req, res) => {
+router.get('/admin/espn-sync', requireAdmin, async (req, res) => {
   try {
     const scoreResult = await ESPNScoreService.syncScoresToGames('00000000-0000-0000-0000-000000002026');
     let pickResult = { scored: 0 };
@@ -337,7 +353,7 @@ router.get('/admin/espn-sync', async (req, res) => {
   }
 });
 
-router.post('/admin/espn-sync', async (req, res) => {
+router.post('/admin/espn-sync', requireAdmin, async (req, res) => {
   try {
     const scoreResult = await ESPNScoreService.syncScoresToGames('00000000-0000-0000-0000-000000002026');
     let pickResult = { scored: 0 };
@@ -354,7 +370,7 @@ router.post('/admin/espn-sync', async (req, res) => {
 // ═══════════════════════════════════════════
 // Send pick reminders to users without picks
 // ═══════════════════════════════════════════
-router.get('/admin/send-reminders', async (req, res) => {
+router.get('/admin/send-reminders', requireAdmin, async (req, res) => {
   try {
     const result = await EmailReminder.sendPickReminders();
     res.json({ message: 'Reminders processed', ...result });
@@ -365,7 +381,7 @@ router.get('/admin/send-reminders', async (req, res) => {
 });
 
 
-router.get("/admin/send-reminders", async (req, res) => {
+router.get("/admin/send-reminders", requireAdmin, async (req, res) => {
   try {
     const result = await EmailReminder.sendPickReminders();
     res.json({ message: "Reminders processed", ...result });
