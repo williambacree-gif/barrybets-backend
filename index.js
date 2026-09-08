@@ -11,6 +11,7 @@ const mastersRoutes = require('./mastersRoutes');
 const mnfRoutes = require('./mnfRoutes');
 const MNFService = require('./mnfService');
 const cfbRoutes = require('./cfbRoutes');
+const authRoutes = require('./authRoutes');
 const CFBService = require('./cfbService');
 const { supabaseAdmin } = require('./supabase');
 
@@ -28,6 +29,7 @@ app.use('/api', apiRoutes);
 app.use('/api/masters', mastersRoutes);
 app.use('/api/mnf', mnfRoutes);
 app.use('/api/cfb', cfbRoutes);
+app.use('/api/auth', authRoutes);
 
 app.get('/api/health', (req, res) => {
     res.json({ status: 'alive', app: 'Barry Bets', timestamp: new Date().toISOString() });
