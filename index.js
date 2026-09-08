@@ -212,6 +212,23 @@ cron.schedule('*/10 0-2 * * 5,6,0,1', async () => {
     } catch (err) { console.error('[CFB Cron] Late pipeline failed:', err.message); }
 }, ET);
 
+// The same safety net the NFL pool has. The weekend crons above already
+// cover Thursday through Monday, so the gap here is much smaller — but a
+// restart landing in the wrong hour, or a game that finishes after 2am
+// Monday, would still leave the week ungraded, and checking costs nothing.
+cron.schedule('0 9 * * *', async () => {
+    try {
+        const s = await activeCfbSeason();
+        if (!s) return;
+        const wk = await cfbCurrentWeek(s.id);
+        if (!wk) return;
+        const r = await CFBService.runWeeklyPipeline(s.id, wk);
+        if (r.graded.graded > 0) {
+            console.log('[CFB Catch-up] Caught something the weekend runs missed:', JSON.stringify(r));
+        }
+    } catch (err) { console.error('[CFB Catch-up] Failed:', err.message); }
+}, ET);
+
 // ═══════════════════════════════════════════════════════════════
 
 app.use((err, req, res, next) => {
