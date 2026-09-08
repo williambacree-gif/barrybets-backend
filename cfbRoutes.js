@@ -228,9 +228,13 @@ router.post('/buyback', requireAuth, async (req, res) => {
     const result = await CFBService.buyBack(season.id, me.id, week);
     // You are back in straight away; the charge is recorded unpaid so
     // nobody sits eliminated waiting for someone to notice a Venmo.
+    // The admin holds the pot, so their own charges land already settled —
+    // there is no sense asking them to Venmo themselves.
+    const selfFunded = isPoolAdmin(req);
     await supabaseAdmin.from('cfb_payments').insert({
       season_id: season.id, player_id: me.id, kind: 'buyback',
-      amount: Number(season.buyback_fee), pool_week: week, paid: false,
+      amount: Number(season.buyback_fee), pool_week: week,
+      paid: selfFunded, paid_at: selfFunded ? new Date().toISOString() : null,
     });
     res.json({ ...result, owes: Number(season.buyback_fee) });
   } catch (err) { res.status(400).json({ error: err.message }); }
