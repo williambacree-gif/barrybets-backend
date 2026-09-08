@@ -20,6 +20,17 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// Where the money goes. One fixed note shape so payments arrive
+// labelled and are easy to match against the ledger.
+const VENMO = 'Will-Acree';
+
+// requireAdmin above is a shared secret for scripts and crons. The Money
+// view needs a different question answered: does the SIGNED-IN USER run
+// this pool? Set CFB_ADMIN_USER_ID in Railway to change it.
+const ADMIN_USER_ID = process.env.CFB_ADMIN_USER_ID
+  || '2bd9768c-8a46-47ee-93cf-53be1e2f4fb6';
+const isPoolAdmin = req => req.user && req.user.id === ADMIN_USER_ID;
+
 async function activeSeason() {
   const { data } = await supabaseAdmin
     .from('mnf_seasons')
@@ -67,11 +78,30 @@ router.get('/season', requireAuth, async (req, res) => {
       .limit(1)
       .maybeSingle();
 
+    const me = (players || []).find(p => p.user_id === req.user.id) || null;
+
+    // What this player still owes, so most of it settles itself
+    // without anyone having to chase anyone.
+    let myCharges = [];
+    if (me) {
+      const { data: mine } = await supabaseAdmin
+        .from('mnf_payments')
+        .select('id, kind, amount, pool_week, paid, created_at')
+        .eq('season_id', season.id).eq('player_id', me.id).order('created_at');
+      myCharges = mine || [];
+    }
+    const myBalance = myCharges.filter(c => !c.paid)
+      .reduce((n, c) => n + Number(c.amount), 0);
+
     res.json({
       season,
       players: players || [],
       current_week: next ? next.week_no : null,
-      me: (players || []).find(p => p.user_id === req.user.id) || null,
+      me,
+      is_admin: isPoolAdmin(req),
+      venmo: VENMO,
+      my_balance: myBalance,
+      my_charges: myCharges,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -197,6 +227,61 @@ router.post('/pick', requireAuth, async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// ─────────────────────────────────────────────────────────────
+// THE BOOKS
+// ─────────────────────────────────────────────────────────────
+
+// Signed-in-admin only, checked here rather than merely hidden in the UI.
+router.get('/ledger', requireAuth, async (req, res) => {
+  try {
+    if (!isPoolAdmin(req)) return res.status(403).json({ error: 'Admins only' });
+    const season = await activeSeason();
+    if (!season) return res.status(404).json({ error: 'No active MNF season' });
+
+    const { data: rows } = await supabaseAdmin
+      .from('mnf_payments')
+      .select('id, player_id, kind, amount, pool_week, paid, paid_at, created_at')
+      .eq('season_id', season.id);
+    const { data: players } = await supabaseAdmin
+      .from('mnf_players').select('id, display_name').eq('season_id', season.id);
+
+    const byId = Object.fromEntries((players || []).map(p => [p.id, p]));
+    const items = (rows || []).map(r => ({
+      ...r,
+      amount: Number(r.amount),
+      display_name: byId[r.player_id] ? byId[r.player_id].display_name : 'Unknown',
+    })).sort((a, b) =>
+      Number(a.paid) - Number(b.paid)
+      || a.display_name.localeCompare(b.display_name));
+
+    const sum = list => list.reduce((n, i) => n + i.amount, 0);
+    const collected = sum(items.filter(i => i.paid));
+    const outstanding = sum(items.filter(i => !i.paid));
+
+    res.json({ ok: true, items, collected, outstanding,
+      pot: collected + outstanding, venmo: VENMO });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/mark-paid', requireAuth, async (req, res) => {
+  try {
+    if (!isPoolAdmin(req)) return res.status(403).json({ error: 'Admins only' });
+    const season = await activeSeason();
+    if (!season) return res.status(404).json({ error: 'No active MNF season' });
+
+    const { payment_id, paid } = req.body || {};
+    if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
+
+    const { error } = await supabaseAdmin.from('mnf_payments').update({
+      paid: !!paid,
+      paid_at: paid ? new Date().toISOString() : null,
+      marked_by: paid ? req.user.id : null,
+    }).eq('id', payment_id).eq('season_id', season.id);
+    if (error) throw error;
+    res.json({ ok: true, payment_id, paid: !!paid });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ─────────────────────────────────────────────────────────────
