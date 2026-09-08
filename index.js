@@ -16,6 +16,13 @@ const CFBService = require('./cfbService');
 const { supabaseAdmin } = require('./supabase');
 
 const app = express();
+
+// Railway terminates TLS at its edge, so every request arrives with an
+// X-Forwarded-For header. Without this, express-rate-limit refuses to
+// trust it (ERR_ERL_UNEXPECTED_X_FORWARDED_FOR in the logs) and buckets
+// everyone under the proxy's single IP — meaning one player burning
+// through the password-reset limit would lock out the rest.
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const TOURNAMENT_ID = '00000000-0000-0000-0000-000000002026';
 const ET = { timezone: 'America/New_York' };
