@@ -17,6 +17,17 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// Where the money goes. The note shape is fixed so payments arrive
+// labelled and are easy to match against the ledger.
+const VENMO = 'Will-Acree';
+
+// requireAdmin above is a shared-secret guard for scripts and crons. The
+// Money view needs to know whether the SIGNED-IN USER runs the pool, which
+// is a different question. Set CFB_ADMIN_USER_ID in Railway to change it.
+const ADMIN_USER_ID = process.env.CFB_ADMIN_USER_ID
+  || '2bd9768c-8a46-47ee-93cf-53be1e2f4fb6';
+const isPoolAdmin = req => req.user && req.user.id === ADMIN_USER_ID;
+
 async function activeSeason() {
   const { data } = await supabaseAdmin
     .from('cfb_seasons').select('*').eq('status', 'active')
@@ -59,11 +70,25 @@ router.get('/season', requireAuth, async (req, res) => {
     const { count: buybackCount } = await supabaseAdmin
       .from('cfb_buybacks').select('*', { count: 'exact', head: true }).eq('season_id', season.id);
 
+    let myCharges = [];
+    if (me) {
+      const { data: mine } = await supabaseAdmin
+        .from('cfb_payments').select('id, kind, amount, pool_week, paid, created_at')
+        .eq('season_id', season.id).eq('player_id', me.id).order('created_at');
+      myCharges = mine || [];
+    }
+    const myBalance = myCharges.filter(c => !c.paid)
+      .reduce((n, c) => n + Number(c.amount), 0);
+
     res.json({
       season, players: players || [], me, current_week: week,
       pot: Number(season.entry_fee) * (players || []).length
          + Number(season.buyback_fee) * (buybackCount || 0),
       can_buy_back: !!me && me.status === 'eliminated' && week <= season.buyback_through_week,
+      is_admin: isPoolAdmin(req),
+      venmo: VENMO,
+      my_balance: myBalance,
+      my_charges: myCharges,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -201,13 +226,72 @@ router.post('/buyback', requireAuth, async (req, res) => {
 
     const week = await currentWeek(season.id);
     const result = await CFBService.buyBack(season.id, me.id, week);
-    res.json(result);
+    // You are back in straight away; the charge is recorded unpaid so
+    // nobody sits eliminated waiting for someone to notice a Venmo.
+    await supabaseAdmin.from('cfb_payments').insert({
+      season_id: season.id, player_id: me.id, kind: 'buyback',
+      amount: Number(season.buyback_fee), pool_week: week, paid: false,
+    });
+    res.json({ ...result, owes: Number(season.buyback_fee) });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ─────────────────────────────────────────────────────────────
 // ADMIN
 // ─────────────────────────────────────────────────────────────
+
+// The books. Signed-in-admin only, checked here rather than in the UI.
+router.get('/ledger', requireAuth, async (req, res) => {
+  try {
+    if (!isPoolAdmin(req)) return res.status(403).json({ error: 'Admins only' });
+    const season = await activeSeason();
+    if (!season) return res.status(404).json({ error: 'No active CFB season' });
+
+    const { data: rows } = await supabaseAdmin
+      .from('cfb_payments')
+      .select('id, player_id, kind, amount, pool_week, paid, paid_at, created_at')
+      .eq('season_id', season.id);
+    const { data: players } = await supabaseAdmin
+      .from('cfb_players').select('id, display_name, status').eq('season_id', season.id);
+
+    const byId = Object.fromEntries((players || []).map(p => [p.id, p]));
+    const items = (rows || []).map(r => ({
+      ...r,
+      amount: Number(r.amount),
+      display_name: byId[r.player_id] ? byId[r.player_id].display_name : 'Unknown',
+      player_status: byId[r.player_id] ? byId[r.player_id].status : null,
+    })).sort((a, b) =>
+      Number(a.paid) - Number(b.paid)
+      || a.display_name.localeCompare(b.display_name)
+      || a.kind.localeCompare(b.kind));
+
+    const sum = list => list.reduce((n, i) => n + i.amount, 0);
+    const collected = sum(items.filter(i => i.paid));
+    const outstanding = sum(items.filter(i => !i.paid));
+
+    res.json({ ok: true, items, collected, outstanding,
+      pot: collected + outstanding, venmo: VENMO });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/mark-paid', requireAuth, async (req, res) => {
+  try {
+    if (!isPoolAdmin(req)) return res.status(403).json({ error: 'Admins only' });
+    const season = await activeSeason();
+    if (!season) return res.status(404).json({ error: 'No active CFB season' });
+
+    const { payment_id, paid } = req.body || {};
+    if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
+
+    const { error } = await supabaseAdmin.from('cfb_payments').update({
+      paid: !!paid,
+      paid_at: paid ? new Date().toISOString() : null,
+      marked_by: paid ? req.user.id : null,
+    }).eq('id', payment_id).eq('season_id', season.id);
+    if (error) throw error;
+    res.json({ ok: true, payment_id, paid: !!paid });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
 
 router.post('/admin/create-season', requireAdmin, async (req, res) => {
   try {
