@@ -42,13 +42,20 @@ async function meIn(seasonId, userId) {
 }
 
 // The week we should be showing: earliest week with unfinished games.
+//
+// pool_week 0 is the parking lot — real ranked games deliberately kept off
+// the board because they kick off before the pool's own deadline. They must
+// be skipped here, or "earliest unfinished week" is 0 and the board shows
+// precisely the games nobody may pick while hiding the ones they may.
 async function currentWeek(seasonId) {
   const { data: pending } = await supabaseAdmin
     .from('cfb_games').select('pool_week').eq('season_id', seasonId)
+    .gt('pool_week', 0)
     .neq('status', 'final').order('pool_week').limit(1).maybeSingle();
   if (pending) return pending.pool_week;
   const { data: last } = await supabaseAdmin
     .from('cfb_games').select('pool_week').eq('season_id', seasonId)
+    .gt('pool_week', 0)
     .order('pool_week', { ascending: false }).limit(1).maybeSingle();
   return last ? last.pool_week : 1;
 }
