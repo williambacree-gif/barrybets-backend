@@ -90,9 +90,12 @@ async function activeCfbSeason() {
     return data;
 }
 
+// pool_week 0 is the parking lot: ranked games deliberately kept off the
+// board. Skip it, or every cron below works on the week nobody can pick.
 async function cfbCurrentWeek(seasonId) {
     const { data: pending } = await supabaseAdmin
         .from('cfb_games').select('pool_week').eq('season_id', seasonId)
+        .gt('pool_week', 0)
         .neq('status', 'final').order('pool_week').limit(1).maybeSingle();
     return pending ? pending.pool_week : null;
 }
