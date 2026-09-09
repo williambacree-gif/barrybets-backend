@@ -121,12 +121,16 @@ class CFBService {
       };
 
       const { data: existing } = await supabaseAdmin
-        .from('cfb_games').select('id, status')
+        .from('cfb_games').select('id, status, pool_week')
         .eq('season_id', seasonId).eq('espn_event_id', String(ev.id)).maybeSingle();
 
       if (existing) {
         if (existing.status === 'final') continue;
-        await supabaseAdmin.from('cfb_games').update(row).eq('id', existing.id);
+        // A parked game still gets fresh kickoff times, ranks and odds, but
+        // it stays parked. Otherwise the weekly refresh quietly undoes the
+        // decision to keep it off the board.
+        const fields = existing.pool_week === 0 ? { ...row, pool_week: 0 } : row;
+        await supabaseAdmin.from('cfb_games').update(fields).eq('id', existing.id);
       } else {
         await supabaseAdmin.from('cfb_games').insert(row);
       }
