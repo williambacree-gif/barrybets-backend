@@ -35,6 +35,15 @@ async function activeSeason() {
   return data;
 }
 
+// "-6.5" if this side was favored, "+6.5" if it was not. Null when the
+// book never posted a number for the game.
+function lineText(game, side) {
+  if (!game || game.spread_value == null || !game.favorite) return null;
+  const n = Number(game.spread_value);
+  if (n === 0) return 'PK';
+  return (game.favorite === side ? '-' : '+') + n;
+}
+
 async function meIn(seasonId, userId) {
   const { data } = await supabaseAdmin
     .from('cfb_players').select('*').eq('season_id', seasonId).eq('user_id', userId).maybeSingle();
@@ -163,6 +172,75 @@ router.get('/leaderboard', requireAuth, async (req, res) => {
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// One player's season, week by week — what the leaderboard opens when you
+// tap a name.
+//
+// A week shows only once its picks are locked. Before that, revealing a
+// rival's team would hand him the one thing this pool is built on hiding.
+// The row still appears, so you can see a pick exists without seeing it.
+router.get('/history/:playerId', requireAuth, async (req, res) => {
+  try {
+    const season = await activeSeason();
+    if (!season) return res.status(404).json({ error: 'No active CFB season' });
+
+    const me = await meIn(season.id, req.user.id);
+    if (!me) return res.status(403).json({ error: "You're not in this pool" });
+
+    const { data: player } = await supabaseAdmin
+      .from('cfb_players').select('id, display_name, user_id, status')
+      .eq('season_id', season.id).eq('id', req.params.playerId).maybeSingle();
+    if (!player) return res.status(404).json({ error: 'Player not found' });
+
+    const { data: picks } = await supabaseAdmin
+      .from('cfb_picks')
+      .select('pool_week, picked_team, picked_side, result, game_id')
+      .eq('season_id', season.id).eq('player_id', player.id).order('pool_week');
+
+    const lockedWeek = {};
+    for (const w of [...new Set((picks || []).map(p => p.pool_week))]) {
+      lockedWeek[w] = await CFBService.isLocked(season.id, w);
+    }
+
+    const ids = (picks || []).map(p => p.game_id).filter(Boolean);
+    let byId = {};
+    if (ids.length) {
+      const { data: games } = await supabaseAdmin
+        .from('cfb_games')
+        .select('id, home_team, away_team, home_score, away_score, status, favorite, spread_value, kickoff_at')
+        .in('id', ids);
+      byId = Object.fromEntries((games || []).map(g => [g.id, g]));
+    }
+
+    const mine = player.user_id === req.user.id;
+    const weeks = (picks || []).map(p => {
+      if (!mine && !lockedWeek[p.pool_week]) {
+        return { pool_week: p.pool_week, hidden: true };
+      }
+      const g = byId[p.game_id] || null;
+      const foe = p.picked_side === 'home' ? 'away' : 'home';
+      return {
+        pool_week: p.pool_week,
+        hidden: false,
+        team: p.picked_team,
+        opponent: g ? (foe === 'home' ? g.home_team : g.away_team) : null,
+        home_away: p.picked_side,
+        result: p.result,
+        status: g ? g.status : null,
+        kickoff_at: g ? g.kickoff_at : null,
+        score_for: g ? (p.picked_side === 'home' ? g.home_score : g.away_score) : null,
+        score_against: g ? (p.picked_side === 'home' ? g.away_score : g.home_score) : null,
+        // Informational only. This pool is straight up and the spread never
+        // grades anything — it is here because people want to know whether
+        // the win was the one the books expected.
+        line: lineText(g, p.picked_side),
+      };
+    });
+
+    res.json({ player, weeks });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 
 // ─────────────────────────────────────────────────────────────
 // PICK
