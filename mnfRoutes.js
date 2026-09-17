@@ -8,7 +8,7 @@ const router = express.Router();
 const { requireAuth } = require('./auth');
 const { supabaseAdmin } = require('./supabase');
 const MNFService = require('./mnfService');
-const { seedSchedule, generateSchedule } = require('./mnfSchedule');
+const { seedSchedule, generateSchedule, NIGHTS } = require('./mnfSchedule');
 
 // Admin routes need a shared secret. Set MNF_ADMIN_TOKEN in Railway.
 // (The existing /api/admin/* routes are wide open — worth locking down too.)
@@ -43,6 +43,32 @@ async function activeSeason() {
 }
 
 const PLAYER_FIELDS = 'id, display_name, user_id';
+
+// The week's headline game. Older clients still look for a single `game`,
+// so every response keeps one under that name.
+function anchorOf(slate) {
+  if (!slate || !slate.length) return null;
+  return slate.find(g => g.slot_name === 'MNF') || slate[slate.length - 1];
+}
+
+// A week's three rounds, in the order they are played. Each round is one
+// game and the two matchups riding on it, and each locks at its own
+// kickoff — nobody has to wait on Thursday to settle Monday.
+function roundsOf(slate, matchups) {
+  const bySlot = Object.fromEntries((slate || []).map(g => [g.slot_name, g]));
+  const now = new Date();
+  return NIGHTS
+    .filter(slot => bySlot[slot])
+    .map(slot => {
+      const game = bySlot[slot];
+      return {
+        slot_name: slot,
+        game,
+        locked: new Date(game.kickoff_at) <= now,
+        matchups: (matchups || []).filter(m => m.slot_name === slot),
+      };
+    });
+}
 
 // Attach player objects to matchup rows.
 async function hydrate(seasonId, matchups) {
@@ -108,25 +134,39 @@ router.get('/season', requireAuth, async (req, res) => {
   }
 });
 
-// One week: the game, the frozen spread, both matchups
+// One week: its three primetime rounds, each with its game, its frozen
+// spread and its two matchups.
 router.get('/week/:week', requireAuth, async (req, res) => {
   try {
     const season = await activeSeason();
     if (!season) return res.status(404).json({ error: 'No active MNF season' });
     const week = parseInt(req.params.week, 10);
 
-    const { data: game } = await supabaseAdmin
+    const { data: games } = await supabaseAdmin
       .from('mnf_games').select('*')
-      .eq('season_id', season.id).eq('week_no', week).maybeSingle();
+      .eq('season_id', season.id).eq('week_no', week).order('kickoff_at');
+    const slate = games || [];
 
     const { data: raw } = await supabaseAdmin
       .from('mnf_matchups').select('*')
       .eq('season_id', season.id).eq('week_no', week).order('slot');
 
-    const matchups = await hydrate(season.id, raw || []);
-    const locked = game ? new Date(game.kickoff_at) <= new Date() : false;
+    const bySlot = Object.fromEntries(slate.map(g => [g.slot_name, g]));
+    const matchups = (await hydrate(season.id, raw || []))
+      .map(m => ({ ...m, game: bySlot[m.slot_name] || null }));
 
-    res.json({ week, game: game || null, matchups, locked });
+    const rounds = roundsOf(slate, matchups);
+
+    res.json({
+      week,
+      games: slate,
+      rounds,
+      game: anchorOf(slate),
+      matchups,
+      // True only when every round is shut. Individual rounds carry their
+      // own flag, which is what the screen actually goes by.
+      locked: rounds.length > 0 && rounds.every(r => r.locked),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -139,19 +179,33 @@ router.get('/schedule', requireAuth, async (req, res) => {
     if (!season) return res.status(404).json({ error: 'No active MNF season' });
 
     const { data: games } = await supabaseAdmin
-      .from('mnf_games').select('*').eq('season_id', season.id).order('week_no');
+      .from('mnf_games').select('*').eq('season_id', season.id)
+      .order('week_no').order('kickoff_at');
     const { data: raw } = await supabaseAdmin
       .from('mnf_matchups').select('*').eq('season_id', season.id).order('week_no').order('slot');
 
-    const matchups = await hydrate(season.id, raw || []);
-    const gameByWeek = Object.fromEntries((games || []).map(g => [g.week_no, g]));
+    const slateByWeek = {};
+    for (const g of games || []) (slateByWeek[g.week_no] = slateByWeek[g.week_no] || []).push(g);
+
+    // Each matchup carries the game it is actually played on, so a name
+    // tapped anywhere can show the right team, line and score.
+    const matchups = (await hydrate(season.id, raw || [])).map(m => {
+      const slate = slateByWeek[m.week_no] || [];
+      return { ...m, game: slate.find(g => g.slot_name === m.slot_name) || null };
+    });
 
     const weeks = [...new Set(matchups.map(m => m.week_no))].sort((a, b) => a - b);
-    res.json(weeks.map(w => ({
-      week_no: w,
-      game: gameByWeek[w] || null,
-      matchups: matchups.filter(m => m.week_no === w),
-    })));
+    res.json(weeks.map(w => {
+      const slate = slateByWeek[w] || [];
+      const mine = matchups.filter(m => m.week_no === w);
+      return {
+        week_no: w,
+        games: slate,
+        game: anchorOf(slate),
+        rounds: roundsOf(slate, mine),
+        matchups: mine,
+      };
+    }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -197,16 +251,25 @@ router.post('/pick', requireAuth, async (req, res) => {
       return res.status(403).json({ error: "It isn't your pick this week" });
     }
 
+    // A matchup names its own night, so there is nothing for the picker to
+    // choose here beyond the side — and nothing to gain by waiting.
     const { data: game } = await supabaseAdmin
       .from('mnf_games').select('*')
-      .eq('season_id', matchup.season_id).eq('week_no', matchup.week_no).maybeSingle();
-    if (!game) return res.status(400).json({ error: 'No game scheduled for that week yet' });
+      .eq('season_id', matchup.season_id)
+      .eq('week_no', matchup.week_no)
+      .eq('slot_name', matchup.slot_name)
+      .maybeSingle();
+    if (!game) {
+      return res.status(400).json({
+        error: `No ${matchup.slot_name} game scheduled for week ${matchup.week_no} yet`,
+      });
+    }
 
     if (!game.spread_frozen_at) {
-      return res.status(400).json({ error: 'The spread has not been set yet — it freezes Wednesday morning' });
+      return res.status(400).json({ error: 'The line on this game has not been set yet — lines freeze Wednesday morning' });
     }
     if (new Date(game.kickoff_at) <= new Date()) {
-      return res.status(400).json({ error: 'Picks are locked — the game has kicked off' });
+      return res.status(400).json({ error: 'Picks are locked — this game has kicked off' });
     }
     if (matchup.result !== 'pending') {
       return res.status(400).json({ error: 'That matchup is already graded' });
@@ -291,7 +354,12 @@ router.post('/mark-paid', requireAuth, async (req, res) => {
 // Preview a schedule draw without writing anything
 router.post('/admin/preview-schedule', requireAdmin, (req, res) => {
   try {
-    const { players, weeks = 17, seed } = req.body;
+    const { players, from_week = 3, to_week = 17, seed } = req.body;
+    // Assume all three rounds, which is what a normal week has.
+    const weeks = [];
+    for (let w = Number(from_week); w <= Number(to_week); w++) {
+      weeks.push({ week_no: w, slots: NIGHTS });
+    }
     res.json(generateSchedule(players, weeks, seed));
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -336,12 +404,39 @@ router.post('/admin/seed-games', requireAdmin, async (req, res) => {
   }
 });
 
+// Widen a range of weeks to all three primetime rounds. from_week is
+// required and has no default: weeks already played, or already open for
+// picks, must not be rewritten underneath the players.
+router.post('/admin/seed-primetime', requireAdmin, async (req, res) => {
+  try {
+    const season = await activeSeason();
+    if (!season) return res.status(404).json({ error: 'No active MNF season' });
+    const { from_week, to_week = 18 } = req.body || {};
+    if (!from_week) {
+      return res.status(400).json({
+        error: 'from_week is required — widening a week that is already open would rewrite it',
+      });
+    }
+    res.json(await MNFService.seedPrimetimeGames(
+      season.id, season.year, Number(from_week), Number(to_week)));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Draw the head-to-heads. Reads the games to learn which rounds each week
+// actually has, so run seed-primetime first.
 router.post('/admin/seed-schedule', requireAdmin, async (req, res) => {
   try {
     const season = await activeSeason();
     if (!season) return res.status(404).json({ error: 'No active MNF season' });
-    const { weeks = 17, seed } = req.body;
-    res.json(await seedSchedule(season.id, weeks, seed));
+    const { from_week, to_week = 18, seed } = req.body || {};
+    if (!from_week) {
+      return res.status(400).json({
+        error: 'from_week is required — refusing to redraw weeks that have been played',
+      });
+    }
+    res.json(await seedSchedule(season.id, Number(from_week), Number(to_week), seed));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
