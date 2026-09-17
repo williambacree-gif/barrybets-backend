@@ -31,10 +31,29 @@ function normTeam(name) {
     .trim();
 }
 
+// ESPN returns UTC. Convert to Eastern before asking what day it is, or an
+// 8:15pm Monday kickoff reads as Tuesday.
+function inET(iso) {
+  return new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/New_York' }));
+}
+
 function isMondayET(iso) {
-  // ESPN returns UTC. Convert to Eastern before asking what day it is.
-  const et = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  return et.getDay() === 1;
+  return inET(iso).getDay() === 1;
+}
+
+// Which primetime round a kickoff belongs to, or null for the Sunday
+// afternoon games this pool has never cared about.
+//
+//   TNF : any Thursday game
+//   SNF : a Sunday kickoff at 7pm ET or later, i.e. the night game
+//   MNF : any Monday game
+function slotFor(iso) {
+  const et = inET(iso);
+  const day = et.getDay();
+  if (day === 4) return 'TNF';
+  if (day === 1) return 'MNF';
+  if (day === 0 && et.getHours() >= 19) return 'SNF';
+  return null;
 }
 
 // ESPN's ?dates=YYYYMMDD parameter is Eastern-based, not UTC. An 8:15pm ET
@@ -53,42 +72,60 @@ class MNFService {
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * Pull the Monday night game for one NFL week from ESPN.
-   * Returns null when the week has no Monday game.
+   * One game per primetime slot for an NFL week, earliest kickoff first.
+   *
+   * At most one game per slot: the round is a single head-to-head on a
+   * single number, so a Thursday doubleheader or a Thanksgiving triple
+   * keeps only the late game — the one everybody actually watches.
    */
-  static async fetchWeekGame(year, week) {
+  static async fetchWeekGames(year, week) {
     try {
       const url = `${ESPN_NFL}?dates=${year}&seasontype=2&week=${week}`;
       const { data } = await axios.get(url, { timeout: 15000 });
-      const events = (data && data.events) || [];
 
-      const monday = events.filter(e => isMondayET(e.date));
-      if (!monday.length) return null;
+      const bySlot = {};
+      for (const event of (data && data.events) || []) {
+        const slot = slotFor(event.date);
+        if (!slot) continue;
 
-      // If the league schedules a Monday doubleheader, take the later game —
-      // that is the one everybody actually watches.
-      monday.sort((a, b) => new Date(b.date) - new Date(a.date));
-      const event = monday[0];
-      const comp = event.competitions && event.competitions[0];
-      if (!comp) return null;
+        const comp = event.competitions && event.competitions[0];
+        if (!comp) continue;
+        const home = comp.competitors.find(c => c.homeAway === 'home');
+        const away = comp.competitors.find(c => c.homeAway === 'away');
+        if (!home || !away) continue;
 
-      const home = comp.competitors.find(c => c.homeAway === 'home');
-      const away = comp.competitors.find(c => c.homeAway === 'away');
-      if (!home || !away) return null;
+        const row = {
+          week_no: week,
+          slot_name: slot,
+          espn_event_id: String(event.id),
+          home_team: home.team.displayName,
+          away_team: away.team.displayName,
+          home_abbr: home.team.abbreviation,
+          away_abbr: away.team.abbreviation,
+          kickoff_at: event.date,
+        };
 
-      return {
-        week_no: week,
-        espn_event_id: String(event.id),
-        home_team: home.team.displayName,
-        away_team: away.team.displayName,
-        home_abbr: home.team.abbreviation,
-        away_abbr: away.team.abbreviation,
-        kickoff_at: event.date,
-      };
+        const held = bySlot[slot];
+        if (!held || new Date(row.kickoff_at) > new Date(held.kickoff_at)) {
+          bySlot[slot] = row;
+        }
+      }
+
+      return Object.values(bySlot)
+        .sort((a, b) => new Date(a.kickoff_at) - new Date(b.kickoff_at));
     } catch (err) {
       console.error(`[MNF] ESPN week ${week} fetch failed:`, err.message);
-      return null;
+      return [];
     }
+  }
+
+  /**
+   * Just the Monday night game. Still used by the feed check and by
+   * seedSeasonGames, which seeds weeks running on the old shape.
+   */
+  static async fetchWeekGame(year, week) {
+    const games = await this.fetchWeekGames(year, week);
+    return games.find(g => g.slot_name === 'MNF') || null;
   }
 
   /**
@@ -125,6 +162,53 @@ class MNFService {
 
     console.log(`[MNF] Seeded/refreshed ${seeded} games`);
     return { seeded, log };
+  }
+
+  /**
+   * Seed the three primetime rounds — Thursday, Sunday night, Monday
+   * night — across a range of weeks.
+   *
+   * It takes a starting week on purpose. Weeks 1 and 2 were played on the
+   * old one-Monday-game shape with results already on the board, and
+   * widening a week that players have picked in would rewrite history.
+   */
+  static async seedPrimetimeGames(seasonId, year, fromWeek, toWeek = 18) {
+    let added = 0, refreshed = 0;
+    const log = [];
+
+    for (let wk = fromWeek; wk <= toWeek; wk++) {
+      const slate = await this.fetchWeekGames(year, wk);
+      if (!slate.length) { log.push(`Week ${wk}: no primetime games`); continue; }
+
+      for (const game of slate) {
+        // Matching on the slot means the Monday game already seeded the old
+        // way is found and updated rather than duplicated.
+        const { data: existing } = await supabaseAdmin
+          .from('mnf_games')
+          .select('id, status')
+          .eq('season_id', seasonId)
+          .eq('week_no', wk)
+          .eq('slot_name', game.slot_name)
+          .maybeSingle();
+
+        const payload = { ...game, season_id: seasonId, updated_at: new Date().toISOString() };
+
+        if (existing) {
+          if (existing.status === 'final') continue;
+          await supabaseAdmin.from('mnf_games').update(payload).eq('id', existing.id);
+          refreshed++;
+        } else {
+          await supabaseAdmin.from('mnf_games').insert(payload);
+          added++;
+        }
+      }
+
+      log.push(`Week ${wk}: ` +
+        slate.map(g => `${g.slot_name} ${g.away_abbr}@${g.home_abbr}`).join(', '));
+    }
+
+    console.log(`[MNF] Primetime slate: ${added} added, ${refreshed} refreshed`);
+    return { added, refreshed, log };
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -199,7 +283,7 @@ class MNFService {
   static async freezeSpreads(seasonId, { force = false, week = null, windowDays = 7 } = {}) {
     let q = supabaseAdmin
       .from('mnf_games')
-      .select('id, week_no, home_team, away_team, kickoff_at, spread_frozen_at')
+      .select('id, week_no, slot_name, home_team, away_team, kickoff_at, spread_frozen_at')
       .eq('season_id', seasonId)
       .neq('status', 'final');
     if (week) q = q.eq('week_no', week);
@@ -207,9 +291,10 @@ class MNFService {
     const { data: games, error } = await q;
     if (error) throw error;
 
-    // Only freeze the game that is actually coming up. Without this the first
-    // Wednesday run would grab every remaining week at once — locking January's
-    // line in September, months before the books mean anything by it.
+    // Only freeze the games actually coming up. Without this the first
+    // Wednesday run would grab every remaining week at once — locking
+    // January's lines in September, months before the books mean anything
+    // by them. A seven-day window covers all three of this week's rounds.
     const now = Date.now();
     const horizon = now + windowDays * 24 * 60 * 60 * 1000;
 
@@ -247,7 +332,8 @@ class MNFService {
       }).eq('id', game.id);
 
       const favName = spread.favorite === 'home' ? game.home_team : game.away_team;
-      log.push(`Week ${game.week_no}: ${favName} -${spread.spread_value} (${spread.books} books)`);
+      log.push(`Week ${game.week_no} ${game.slot_name}: ${favName} ` +
+        `-${spread.spread_value} (${spread.books} books)`);
       frozen++;
     }
 
@@ -259,12 +345,17 @@ class MNFService {
   // AUTO-ASSIGN — missed deadline gets the favorite
   // ─────────────────────────────────────────────────────────────
 
+  /**
+   * A picker who lets his round's kickoff pass is handed that game's
+   * favorite. Each round stands alone: missing Thursday says nothing about
+   * Sunday, so only the matchups on the game that has started are touched.
+   */
   static async autoAssignMissingPicks(seasonId) {
     const now = new Date();
 
     const { data: games } = await supabaseAdmin
       .from('mnf_games')
-      .select('week_no, kickoff_at, favorite, spread_value, home_team, away_team')
+      .select('week_no, slot_name, kickoff_at, favorite, spread_value, home_team, away_team')
       .eq('season_id', seasonId)
       .not('favorite', 'is', null);
 
@@ -280,6 +371,7 @@ class MNFService {
         .select('id, picker_id')
         .eq('season_id', seasonId)
         .eq('week_no', game.week_no)
+        .eq('slot_name', game.slot_name)
         .is('picked_side', null);
 
       for (const m of open || []) {
@@ -290,7 +382,7 @@ class MNFService {
         }).eq('id', m.id);
 
         const favName = game.favorite === 'home' ? game.home_team : game.away_team;
-        log.push(`Week ${game.week_no}: auto-assigned ${favName} -${game.spread_value}`);
+        log.push(`Week ${game.week_no} ${game.slot_name}: auto-assigned ${favName} -${game.spread_value}`);
         assigned++;
       }
     }
@@ -386,11 +478,15 @@ class MNFService {
       const cover = this.coveringSide(game);
       if (!cover) { log.push(`Week ${game.week_no}: missing spread or score`); continue; }
 
+      // Only this round's matchups. A week now holds three games, and
+      // keying on week_no alone would grade all six matchups off whichever
+      // game happened to go final first.
       const { data: matchups } = await supabaseAdmin
         .from('mnf_matchups')
         .select('id, picked_side, result')
         .eq('season_id', seasonId)
         .eq('week_no', game.week_no)
+        .eq('slot_name', game.slot_name)
         .eq('result', 'pending');
 
       for (const m of matchups || []) {
@@ -413,7 +509,7 @@ class MNFService {
 
       const favName = game.favorite === 'home' ? game.home_team : game.away_team;
       log.push(
-        `Week ${game.week_no}: ${game.away_team} ${game.away_score} - ` +
+        `Week ${game.week_no} ${game.slot_name}: ${game.away_team} ${game.away_score} - ` +
         `${game.home_score} ${game.home_team} | ${favName} -${game.spread_value} | ` +
         (cover === 'push' ? 'PUSH (picker loses)' : `${cover} covered`)
       );
