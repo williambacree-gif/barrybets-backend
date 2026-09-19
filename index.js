@@ -210,6 +210,128 @@ cron.schedule('0 10 * * *', async () => {
 }, ET);
 
 // ═══════════════════════════════════════════════════════════════
+// THE NUDGE
+//
+// Who still owes a pick, and the exact sentence to send them.
+//
+// It deliberately sends nothing itself. Email gets ignored, and no server
+// can send from somebody's iMessage — Apple has no API for it and this box
+// is in a datacentre, not in Will's pocket. So the app does the knowing and
+// the phone does the sending: open this in a browser and copy it, tap the
+// button in the admin view, or let an iPhone Shortcut fetch ?format=text on
+// a schedule and drop it straight into the group thread.
+//
+// No phone numbers live here. The roster stays off this server.
+// ═══════════════════════════════════════════════════════════════
+
+const HOURS = ms => Math.max(0, Math.round(ms / 3600000 * 10) / 10);
+const when = iso => new Date(iso).toLocaleString('en-US', {
+    timeZone: 'America/New_York', weekday: 'short', hour: 'numeric', minute: '2-digit',
+});
+
+async function cfbNudge() {
+    const s = await activeCfbSeason();
+    if (!s) return null;
+    const week = await cfbCurrentWeek(s.id);
+    if (!week) return null;
+
+    const { data: games } = await supabaseAdmin
+        .from('cfb_games').select('kickoff_at')
+        .eq('season_id', s.id).eq('pool_week', week)
+        .order('kickoff_at').limit(1);
+    const lockAt = games && games[0] ? games[0].kickoff_at : null;
+    if (!lockAt) return null;
+    const locked = new Date(lockAt) <= new Date();
+
+    const { data: alive } = await supabaseAdmin
+        .from('cfb_players').select('id, display_name')
+        .eq('season_id', s.id).eq('status', 'alive');
+    const { data: picks } = await supabaseAdmin
+        .from('cfb_picks').select('player_id')
+        .eq('season_id', s.id).eq('pool_week', week);
+
+    const done = new Set((picks || []).map(p => p.player_id));
+    const missing = (alive || []).filter(p => !done.has(p.id)).map(p => p.display_name).sort();
+
+    return { pool: 'College survivor', week, lock_at: lockAt, locked,
+        hours_left: locked ? 0 : HOURS(new Date(lockAt) - Date.now()), missing };
+}
+
+async function mnfNudge() {
+    const s = await activeMnfSeason();
+    if (!s) return null;
+    const { data: next } = await supabaseAdmin
+        .from('mnf_games').select('week_no')
+        .eq('season_id', s.id).neq('status', 'final')
+        .order('week_no').limit(1).maybeSingle();
+    if (!next) return null;
+    const week = next.week_no;
+
+    const { data: games } = await supabaseAdmin
+        .from('mnf_games').select('slot_name, kickoff_at, status')
+        .eq('season_id', s.id).eq('week_no', week).order('kickoff_at');
+    const { data: raw } = await supabaseAdmin
+        .from('mnf_matchups').select('slot_name, picker_id, picked_side')
+        .eq('season_id', s.id).eq('week_no', week);
+    const { data: players } = await supabaseAdmin
+        .from('mnf_players').select('id, display_name').eq('season_id', s.id);
+
+    const nameOf = Object.fromEntries((players || []).map(p => [p.id, p.display_name]));
+    const rounds = [];
+    for (const g of games || []) {
+        // A round that has kicked off is settled one way or the other;
+        // nagging about it only annoys people.
+        if (new Date(g.kickoff_at) <= new Date()) continue;
+        const owed = (raw || [])
+            .filter(m => m.slot_name === g.slot_name && !m.picked_side)
+            .map(m => nameOf[m.picker_id]).filter(Boolean).sort();
+        if (owed.length) {
+            rounds.push({ slot_name: g.slot_name, lock_at: g.kickoff_at,
+                hours_left: HOURS(new Date(g.kickoff_at) - Date.now()), missing: owed });
+        }
+    }
+    return { pool: 'NFL', week, rounds };
+}
+
+const SLOT_WORD = { TNF: 'Thursday night', SNF: 'Sunday night', MNF: 'Monday night' };
+const andList = xs => xs.length < 2 ? (xs[0] || '')
+    : xs.slice(0, -1).join(', ') + ' and ' + xs[xs.length - 1];
+
+function nudgeText(cfb, mnf) {
+    const lines = [];
+    if (cfb && !cfb.locked && cfb.missing.length) {
+        lines.push(`${andList(cfb.missing)} — no survivor pick for week ${cfb.week} yet. `
+            + `Locks ${when(cfb.lock_at)} ET. barrysbets.net`);
+    }
+    for (const r of (mnf && mnf.rounds) || []) {
+        lines.push(`${andList(r.missing)} — ${SLOT_WORD[r.slot_name] || r.slot_name} pick is open. `
+            + `Locks ${when(r.lock_at)} ET. barrysbets.net`);
+    }
+    return lines.join('\n\n');
+}
+
+app.get('/api/nudge', async (req, res) => {
+    const expected = process.env.MNF_ADMIN_TOKEN;
+    if (!expected) return res.status(503).json({ error: 'MNF_ADMIN_TOKEN not configured' });
+    if ((req.headers['x-admin-token'] || req.query.token) !== expected) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    try {
+        const [cfb, mnf] = await Promise.all([cfbNudge(), mnfNudge()]);
+        const text = nudgeText(cfb, mnf);
+        if (req.query.format === 'text') {
+            res.type('text/plain');
+            // Empty body on purpose: a Shortcut can check for it and send
+            // nothing rather than texting the group "all clear" every week.
+            return res.send(text);
+        }
+        res.json({ ok: true, text, nobody_owes: !text, cfb, mnf });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // COLLEGE FOOTBALL SURVIVOR
 // ═══════════════════════════════════════════════════════════════
 
