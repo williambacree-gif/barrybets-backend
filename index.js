@@ -92,6 +92,29 @@ async function activeCfbSeason() {
 
 // pool_week 0 is the parking lot: ranked games deliberately kept off the
 // board. Skip it, or every cron below works on the week nobody can pick.
+// The week whose BOARD should be built next — a different question from
+// which week to grade, and the distinction this pool got wrong.
+//
+// cfbCurrentWeek below returns the earliest week still holding an
+// unfinished game, and null once every game is final. The weekly sync used
+// to call that: the moment a week went final there was no week to sync, so
+// the following week was never created and the pool simply stopped at the
+// last board it had. Week 2 of the 2026 season disappeared exactly this
+// way — the board was not stale, the week did not exist.
+async function cfbWeekToSync(seasonId) {
+    const { data: pending } = await supabaseAdmin
+        .from('cfb_games').select('pool_week').eq('season_id', seasonId)
+        .gt('pool_week', 0)
+        .neq('status', 'final').order('pool_week').limit(1).maybeSingle();
+    if (pending) return pending.pool_week;
+
+    const { data: last } = await supabaseAdmin
+        .from('cfb_games').select('pool_week').eq('season_id', seasonId)
+        .gt('pool_week', 0)
+        .order('pool_week', { ascending: false }).limit(1).maybeSingle();
+    return last ? last.pool_week + 1 : 1;
+}
+
 async function cfbCurrentWeek(seasonId) {
     const { data: pending } = await supabaseAdmin
         .from('cfb_games').select('pool_week').eq('season_id', seasonId)
@@ -190,18 +213,36 @@ cron.schedule('0 10 * * *', async () => {
 // COLLEGE FOOTBALL SURVIVOR
 // ═══════════════════════════════════════════════════════════════
 
-// Rebuild the board after the new poll lands, and again Friday in case
-// of rank changes or kickoff moves.
-for (const expr of ['0 10 * * 2', '0 10 * * 5']) {
+// Build the board after the new poll lands Tuesday, again Friday for rank
+// changes and kickoff moves, and once every morning besides. A board that
+// never gets built is the one failure nobody notices until Saturday, so it
+// gets checked far more often than it should ever need to be.
+for (const expr of ['0 10 * * 2', '0 10 * * 5', '30 6 * * *']) {
     cron.schedule(expr, async () => {
         try {
             const s = await activeCfbSeason();
             if (!s) return;
-            const wk = await cfbCurrentWeek(s.id);
+            const wk = await cfbWeekToSync(s.id);
             if (wk) console.log('[CFB Cron] Sync week', wk, JSON.stringify(await CFBService.syncWeek(s.id, wk)));
         } catch (err) { console.error('[CFB Cron] Week sync failed:', err.message); }
     }, ET);
 }
+
+// Crons never fire on boot. A deploy or restart landing after Tuesday's run
+// means the coming week's board is never built at all, and nobody finds out
+// until kickoff. One sweep shortly after start closes that.
+//
+// Board only. Grading and auto-assign stay on their own schedule, so a week
+// that first appears here can never hand out picks in the same breath.
+setTimeout(async () => {
+    try {
+        const s = await activeCfbSeason();
+        if (!s) return;
+        const wk = await cfbWeekToSync(s.id);
+        if (wk) console.log('[CFB Boot] Board sync week', wk,
+            JSON.stringify(await CFBService.syncWeek(s.id, wk)));
+    } catch (err) { console.error('[CFB Boot] Board sync failed:', err.message); }
+}, 20000);
 
 // Scores and eliminations across the college football weekend.
 cron.schedule('*/10 12-23 * * 4,5,6,0', async () => {
