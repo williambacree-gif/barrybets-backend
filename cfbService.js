@@ -124,6 +124,8 @@ class CFBService {
         .from('cfb_games').select('id, status, pool_week')
         .eq('season_id', seasonId).eq('espn_event_id', String(ev.id)).maybeSingle();
 
+      const alreadyStarted = new Date(row.kickoff_at) <= new Date();
+
       if (existing) {
         if (existing.status === 'final') continue;
         // A parked game still gets fresh kickoff times, ranks and odds, but
@@ -132,7 +134,12 @@ class CFBService {
         const fields = existing.pool_week === 0 ? { ...row, pool_week: 0 } : row;
         await supabaseAdmin.from('cfb_games').update(fields).eq('id', existing.id);
       } else {
-        await supabaseAdmin.from('cfb_games').insert(row);
+        // A game that had already kicked off by the time the board was first
+        // built was never pickable, so it is born in the parking lot. Without
+        // this, a week built late opens ALREADY LOCKED, and the very next
+        // pipeline run hands every player a team he was never shown.
+        await supabaseAdmin.from('cfb_games')
+          .insert(alreadyStarted ? { ...row, pool_week: 0 } : row);
       }
       synced++;
       log.push(`${awayRank ? '#'+awayRank+' ' : ''}${row.away_team} at ${homeRank ? '#'+homeRank+' ' : ''}${row.home_team}`);
