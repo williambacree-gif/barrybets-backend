@@ -150,35 +150,45 @@ cron.schedule('0 9 * * 4', async () => {
     catch (err) { console.error('[MNF Cron] Thursday freeze failed:', err.message); }
 }, ET);
 
-// Monday night: auto-assign missed picks at kickoff, track the score, grade.
-cron.schedule('*/5 20-23 * * 1', async () => {
+// Primetime nights: auto-assign missed picks at kickoff, track the score,
+// grade. There is no single weekly deadline — a week holds three rounds on
+// three different nights, and each one locks at its own kickoff. Miss your
+// Thursday and you are handed that game's favorite off the frozen line;
+// your Sunday and Monday are untouched and still yours to make.
+//
+// So this has to run on all three nights (Thu=4, Sun=0, Mon=1), not Monday
+// alone. Running it Monday-only would leave a missed Thursday pick sitting
+// unassigned, and the Thursday game ungraded, until the next morning sweep.
+cron.schedule('*/5 20-23 * * 0,1,4', async () => {
     try {
         const s = await activeMnfSeason();
         if (!s) return;
         const r = await MNFService.runWeeklyPipeline(s.id);
         if (r.graded.graded > 0 || r.assigned.assigned > 0) console.log('[MNF Cron]', JSON.stringify(r));
-    } catch (err) { console.error('[MNF Cron] Monday pipeline failed:', err.message); }
+    } catch (err) { console.error('[MNF Cron] Primetime pipeline failed:', err.message); }
 }, ET);
 
-cron.schedule('*/5 0-1 * * 2', async () => {
+// The small hours after each of those nights, for a game that runs past
+// midnight ET. Friday, Monday and Tuesday are the mornings after.
+cron.schedule('*/5 0-2 * * 1,2,5', async () => {
     try { const s = await activeMnfSeason(); if (s) await MNFService.runWeeklyPipeline(s.id); }
     catch (err) { console.error('[MNF Cron] Late pipeline failed:', err.message); }
 }, ET);
 
-// Safety net. The two crons above only cover Monday 8pm through Tuesday
-// 2am ET. A game that runs long, or a Railway restart landing inside that
-// six-hour window, would leave the week ungraded until the FOLLOWING
-// Monday — the same shape as the college survivor bug that quietly ate a
-// whole weekend. So: one sweep a day, every day. The pipeline is
-// idempotent (grading only touches matchups still marked pending), so a
-// run with nothing to do costs nothing.
+// Safety net. The crons above cover the three primetime evenings and the
+// small hours after each. A game that runs very long, or a Railway restart
+// landing inside one of those windows, would still leave a round ungraded
+// until the next primetime night — the same shape as the college survivor
+// bug that quietly ate a whole weekend. So: one sweep a day, every day. The
+// pipeline is idempotent (grading only touches matchups still marked
+// pending), so a run with nothing to do costs nothing.
 cron.schedule('0 9 * * *', async () => {
     try {
         const s = await activeMnfSeason();
         if (!s) return;
         const r = await MNFService.runWeeklyPipeline(s.id);
         if (r.graded.graded > 0 || r.assigned.assigned > 0) {
-            console.log('[MNF Catch-up] Caught something the Monday run missed:', JSON.stringify(r));
+            console.log('[MNF Catch-up] Caught something the nightly runs missed:', JSON.stringify(r));
         }
     } catch (err) { console.error('[MNF Catch-up] Failed:', err.message); }
 }, ET);
