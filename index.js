@@ -30,6 +30,10 @@ const ET = { timezone: 'America/New_York' };
 app.use(helmet());
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
+// The admin endpoints take their token in the query string for
+// convenience, which means morgan would otherwise write it into the logs
+// in plain text and leave it sitting there. Keep the path, lose the secret.
+morgan.token('url', req => req.originalUrl.replace(/([?&]token=)[^&]*/gi, '$1[redacted]'));
 app.use(morgan('dev'));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
 app.use('/api', apiRoutes);
