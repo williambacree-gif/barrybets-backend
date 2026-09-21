@@ -18,7 +18,11 @@ const router = express.Router();
 const { supabaseAdmin } = require('./supabase');
 
 const RESEND_KEY = process.env.RESEND_API_KEY;
-const FROM = 'Barry Bets <picks@the1788s.org>';
+// Barry Bets sends from its own domain, verified in Resend on Sep 21 2026
+// with DKIM at resend._domainkey. Sending from the1788s.org meant the
+// address, the branding and the reset link all disagreed, which is exactly
+// the shape spam filters punish — and did: Perk's reset never reached him.
+const FROM = 'Barry Bets <picks@barrysbets.net>';
 const SITE_URL = process.env.SITE_URL || 'https://www.barrysbets.net';
 
 // This endpoint has to be open to signed-out people, so it gets a

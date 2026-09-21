@@ -1,7 +1,8 @@
 const { supabase } = require('./supabase');
 
 const RESEND_KEY = process.env.RESEND_API_KEY;
-const FROM = 'Barry Bets <picks@the1788s.org>';
+// See authRoutes.js — Barry Bets sends from its own verified domain now.
+const FROM = 'Barry Bets <picks@barrysbets.net>';
 const SITE_URL = 'https://barrysbets.net';
 const TOURNAMENT_ID = '00000000-0000-0000-0000-000000002026';
 
