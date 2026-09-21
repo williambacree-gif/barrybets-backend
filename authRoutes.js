@@ -96,4 +96,60 @@ router.post('/request-reset', resetLimiter, async (req, res) => {
   return done();
 });
 
+// A reset link handed back, rather than emailed.
+//
+// Email is the weak link in this flow. The message leaves here fine and
+// then Gmail decides what to do with it, which is how Perk sat locked out
+// for two days over a link that had been minted and accepted. When someone
+// is locked out and the mail has vanished, mint a link here and text it.
+//
+// Guarded by the same shared secret as the other admin routes, and narrowed
+// further: it will only mint for somebody who is actually a player in one
+// of the pools. A leaked token is then worth four accounts, not every
+// account, and not a stranger's.
+router.get('/admin-link', async (req, res) => {
+  const expected = process.env.MNF_ADMIN_TOKEN;
+  if (!expected) return res.status(503).json({ error: 'MNF_ADMIN_TOKEN not configured' });
+  if ((req.headers['x-admin-token'] || req.query.token) !== expected) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  const email = String(req.query.email || '').trim().toLowerCase();
+  if (!email || email.indexOf('@') < 1) {
+    return res.status(400).json({ error: 'Pass ?email=' });
+  }
+
+  try {
+    const { data, error } = await supabaseAdmin.auth.admin.generateLink({
+      type: 'recovery',
+      email: email,
+      options: { redirectTo: SITE_URL },
+    });
+
+    const link = data && data.properties && data.properties.action_link;
+    if (error || !link) {
+      return res.status(404).json({ error: error ? error.message : 'No account for that address' });
+    }
+
+    const uid = data.user && data.user.id;
+    const [cfb, mnf] = await Promise.all([
+      supabaseAdmin.from('cfb_players').select('id').eq('user_id', uid).limit(1),
+      supabaseAdmin.from('mnf_players').select('id').eq('user_id', uid).limit(1),
+    ]);
+    if (!(cfb.data || []).length && !(mnf.data || []).length) {
+      return res.status(403).json({ error: 'That address is not a player in either pool' });
+    }
+
+    console.log('[Reset] admin minted a link for', email);
+    res.json({
+      ok: true,
+      email: email,
+      link: link,
+      note: 'Send this to him directly. Good for one hour, and only once.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
