@@ -25,7 +25,12 @@
 
 const { supabaseAdmin } = require('./supabase');
 
+// The regular season's three primetime slots. Weeks that run on other
+// shapes — week 18 has no Thursday game, and every playoff game is the main
+// event — name their rounds by kickoff order instead (G1, G2, ...), so the
+// draw stays valid before the league announces times.
 const NIGHTS = ['TNF', 'SNF', 'MNF'];
+const isNight = s => NIGHTS.includes(s);
 
 // The three distinct ways to split four players into two pairs.
 function rounds(players) {
@@ -67,8 +72,15 @@ function mulberry32(seed) {
  *                                actually has, so a week the league gives
  *                                no Thursday game simply plays two rounds.
  * @param {string}   seed         optional; omit to draw a fresh one
+ * @param {Object}    startingPicks  pick counts already run up, by name.
+ *        Without this, drawing a mid-season range starts everyone at zero
+ *        and balances only the stretch it can see — leaving the SEASON
+ *        lopsided by however far apart the players already were. Weeks 1
+ *        and 2 of 2026 had Perk on two picks and Will on none, so seeding
+ *        weeks 3 onward from zero would have handed Perk a permanent
+ *        two-pick head start nobody could catch.
  */
-function generateSchedule(playerNames, weeks, seed) {
+function generateSchedule(playerNames, weeks, seed, startingPicks) {
   if (!playerNames || playerNames.length !== 4) {
     throw new Error('This pool needs exactly 4 players');
   }
@@ -85,20 +97,29 @@ function generateSchedule(playerNames, weeks, seed) {
 
   // Pick duty goes to whoever is behind. Tie-break is a fixed random
   // order rather than alphabetical, so no name is quietly favoured.
-  const picks = Object.fromEntries(playerNames.map(p => [p, 0]));
+  const picks = Object.fromEntries(
+    playerNames.map(p => [p, (startingPicks && startingPicks[p]) || 0])
+  );
   const tieBreak = Object.fromEntries(shuffle(playerNames, rand).map((p, i) => [p, i]));
 
   const schedule = [];
 
   for (const wk of weeks) {
-    const available = NIGHTS.filter(n => (wk.slots || []).includes(n));
+    // A week's rounds, in the order they are played. Primetime weeks are
+    // ordered Thursday, Sunday, Monday; anything else is already in kickoff
+    // order as G1, G2, ...
+    const given = wk.slots || [];
+    const available = given.some(isNight)
+      ? NIGHTS.filter(n => given.includes(n))
+      : given.slice();
     if (!available.length) continue;
 
-    // Rotate which round plays which night. With all three nights present
-    // this is a clean rotation; with fewer, the rounds that do not fit are
-    // dropped this week and the rotation moves them along next week.
+    // One round per game, however many there are — three in a normal week,
+    // six on wild card weekend, one for the Super Bowl. Which pairing draws
+    // which game rotates by week so nobody faces the same man in the same
+    // position all year; with six games every pairing comes up twice.
     const matchups = [];
-    for (let i = 0; i < table.length && i < available.length; i++) {
+    for (let i = 0; i < available.length; i++) {
       const round = table[(i + wk.week_no) % table.length];
       const night = available[i];
 
@@ -136,9 +157,18 @@ function summarize(players, schedule) {
 
 /**
  * Sanity checks. Throws if the draw breaks a house rule.
+ *
+ * startingPicks matters here as much as it does in the draw: when a
+ * mid-season range is being balanced AGAINST what came before, the new
+ * stretch is deliberately lopsided in order to even the season out. Judging
+ * the slice on its own would reject exactly the draw that is correct.
  */
-function validate(players, schedule) {
-  const { picks, plays } = summarize(players, schedule);
+function validate(players, schedule, startingPicks) {
+  const { plays } = summarize(players, schedule);
+  const picks = summarize(players, schedule).picks;
+  for (const [n, c] of Object.entries(startingPicks || {})) {
+    picks[n] = (picks[n] || 0) + c;
+  }
   const errs = [];
 
   for (const w of schedule) {
@@ -155,18 +185,28 @@ function validate(players, schedule) {
       }
     }
 
-    // Nobody should meet the same man twice in one week.
-    const seen = new Set();
+    // Four players split into pairs exactly three ways, so a week of more
+    // than three rounds HAS to repeat pairings — wild card weekend's six
+    // games are two complete round-robins. What would be wrong is repeating
+    // one pairing while another never comes up.
+    const met = {};
     for (const m of w.matchups) {
       const k = [m.picker, m.opponent].sort().join('|');
-      if (seen.has(k)) errs.push(`week ${w.week_no} pairs ${k} twice`);
-      seen.add(k);
+      met[k] = (met[k] || 0) + 1;
+    }
+    const counts = Object.values(met);
+    if (counts.length && Math.max(...counts) - Math.min(...counts) > 1) {
+      errs.push(`week ${w.week_no} pairs unevenly: ${JSON.stringify(met)}`);
     }
   }
 
   const spread = list => Math.max(...list) - Math.min(...list);
-  if (spread(Object.values(picks)) > 1) {
-    errs.push(`pick duty is uneven: ${JSON.stringify(picks)}`);
+  // An odd total cannot split four ways exactly, so one apart is the best
+  // arithmetic allows. Anything wider is a real problem.
+  const total = Object.values(picks).reduce((a, b) => a + b, 0);
+  const best = total % 4 === 0 ? 0 : 1;
+  if (spread(Object.values(picks)) > best) {
+    errs.push(`pick duty is uneven: ${JSON.stringify(picks)} (best possible spread ${best})`);
   }
   if (spread(Object.values(plays)) > 0) {
     errs.push(`games played are uneven: ${JSON.stringify(plays)}`);
@@ -230,11 +270,33 @@ async function seedSchedule(seasonId, fromWeek, toWeek = 18, seed) {
     throw new Error('Picks already exist in that range — refusing to regenerate the schedule');
   }
 
+  // How much pick duty each man has already been handed in the weeks this
+  // draw is NOT touching. Feeding these in is what keeps the season even
+  // rather than just this stretch of it.
+  const { data: before } = await supabaseAdmin
+    .from('mnf_matchups')
+    .select('picker_id')
+    .eq('season_id', seasonId)
+    .lt('week_no', fromWeek);
+  const nameById = Object.fromEntries(players.map(p => [p.id, p.display_name]));
+  const startingPicks = {};
+  for (const row of before || []) {
+    const n = nameById[row.picker_id];
+    if (n) startingPicks[n] = (startingPicks[n] || 0) + 1;
+  }
+
   const names = players.map(p => p.display_name);
   const idByName = Object.fromEntries(players.map(p => [p.display_name, p.id]));
 
-  const { seed: usedSeed, weeks: sched, balance } = generateSchedule(names, weeks, seed);
-  validate(names, sched);
+  const { seed: usedSeed, weeks: sched, balance } = generateSchedule(names, weeks, seed, startingPicks);
+  validate(names, sched, startingPicks);
+
+  // Report the SEASON, not just the slice that was drawn. A balance line
+  // that looks level while the season is lopsided is worse than none.
+  const seasonPicks = { ...balance.picks };
+  for (const [n, c] of Object.entries(startingPicks)) {
+    seasonPicks[n] = (seasonPicks[n] || 0) + c;
+  }
 
   const rows = sched.flatMap(w =>
     w.matchups.map(m => ({
@@ -257,7 +319,11 @@ async function seedSchedule(seasonId, fromWeek, toWeek = 18, seed) {
   await supabaseAdmin.from('mnf_seasons').update({ schedule_seed: usedSeed }).eq('id', seasonId);
 
   console.log(`[MNF] Seeded ${rows.length} matchups across ${sched.length} weeks (seed ${usedSeed})`);
-  return { seed: usedSeed, matchups: rows.length, weeks: sched.length, balance };
+  console.log(`[MNF] Season pick duty now ${JSON.stringify(seasonPicks)}`);
+  return {
+    seed: usedSeed, matchups: rows.length, weeks: sched.length,
+    balance, starting_picks: startingPicks, season_picks: seasonPicks,
+  };
 }
 
 module.exports = { generateSchedule, seedSchedule, validate, summarize, NIGHTS };
