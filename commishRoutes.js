@@ -265,9 +265,38 @@ function andList(names) {
   return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
 
+// The commissioner is sending this message, so there is no sense in it
+// nagging him by name. He still shows up in /status, where the point is to
+// tell him what HE owes.
+async function adminPlayerIds() {
+  const ids = new Set();
+  for (const t of ['cfb_players', 'mnf_players']) {
+    const { data } = await supabaseAdmin.from(t).select('id').eq('user_id', ADMIN_USER_ID);
+    for (const r of data || []) ids.add(r.id);
+  }
+  return ids;
+}
+
+const SLOT_WORD = { TNF: 'Thu', SNF: 'Sun night', MNF: 'Mon' };
+
+// NFL mascots are unique across the league, so "Packers" is unambiguous and
+// far shorter than "Green Bay Packers" — the same call MNFPool.jsx makes on
+// screen. In a text message the length genuinely matters.
+const mascot = s => String(s || '').split(' ').pop();
+
+// Everything that leaves here goes into a text message. Em dashes and curly
+// quotes fall outside the GSM-7 alphabet, which forces a phone to re-encode
+// the whole message at 70 characters per segment instead of 160 — turning a
+// two-part text into five. So the wording below stays deliberately plain.
+const plain = s => String(s)
+  .replace(/[\u2014\u2013]/g, '-')
+  .replace(/[\u2018\u2019]/g, "'")
+  .replace(/[\u201C\u201D]/g, '"');
+
 router.get('/nudge', async (req, res) => {
   try {
     const lines = [];
+    const mine = await adminPlayerIds();
 
     const cfb = await activeCfbSeason();
     if (cfb) {
@@ -280,7 +309,9 @@ router.get('/nudge', async (req, res) => {
           .from('cfb_picks').select('player_id')
           .eq('season_id', cfb.id).eq('pool_week', week);
         const picked = new Set((picks || []).map(p => p.player_id));
-        const owe = (players || []).filter(p => !picked.has(p.id)).map(p => p.display_name);
+        const owe = (players || [])
+          .filter(p => !picked.has(p.id) && !mine.has(p.id))
+          .map(p => p.display_name);
         if (owe.length) {
           const lock = await CFBService.lockTime(cfb.id, week);
           lines.push(`${andList(owe)} — no survivor pick for week ${week} yet. Locks ${etLabel(lock)} ET.`);
@@ -306,7 +337,8 @@ router.get('/nudge', async (req, res) => {
         const WORD = { TNF: 'Thursday', SNF: 'Sunday night', MNF: 'Monday night' };
         for (const g of slate || []) {
           if (new Date(g.kickoff_at) <= new Date()) continue;
-          const owe = (ms || []).filter(m => m.slot_name === g.slot_name)
+          const owe = (ms || [])
+            .filter(m => m.slot_name === g.slot_name && !mine.has(m.picker_id))
             .map(m => nameOf[m.picker_id] || 'someone');
           if (owe.length) {
             lines.push(`${andList(owe)} — ${WORD[g.slot_name] || g.slot_name} pick is open until kickoff, ${etLabel(g.kickoff_at)} ET.`);
@@ -315,8 +347,93 @@ router.get('/nudge', async (req, res) => {
       }
     }
 
-    const text = lines.length ? `${lines.join(' ')} barrysbets.net` : '';
+    const text = lines.length ? plain(`${lines.join(' ')} barrysbets.net`) : '';
     res.json({ text, owed: lines.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────
+// THE WEEK AHEAD — who picks which game
+//
+// The nudge chases people who are late. This is the opposite: sent before
+// anyone is late, laying out all three rounds so nobody has to open the
+// app to find out whether this is their week to pick, or against whom.
+//
+// Every picker is named, the commissioner included — the other three need
+// to know who they are playing.
+// ─────────────────────────────────────────────────────────────
+router.get('/week-ahead', async (req, res) => {
+  try {
+    const parts = [];
+    const mine = await adminPlayerIds();
+
+    const nfl = await activeMnfSeason();
+    const week = nfl ? await mnfCurrentWeek(nfl.id) : null;
+
+    if (nfl && week) {
+      const { data: slate } = await supabaseAdmin
+        .from('mnf_games')
+        .select('slot_name, away_team, home_team, kickoff_at, favorite, spread_value, spread_frozen_at')
+        .eq('season_id', nfl.id).eq('week_no', week).order('kickoff_at');
+
+      const { data: ms } = await supabaseAdmin
+        .from('mnf_matchups')
+        .select('slot_name, slot, picker_id, opponent_id, picked_side')
+        .eq('season_id', nfl.id).eq('week_no', week).order('slot');
+
+      const { data: roster } = await supabaseAdmin
+        .from('mnf_players').select('id, display_name').eq('season_id', nfl.id);
+      const nameOf = Object.fromEntries((roster || []).map(p => [p.id, p.display_name]));
+
+      parts.push(`Barry Bets - NFL week ${week}`);
+
+      for (const g of slate || []) {
+        const line = g.favorite && g.spread_value != null
+          ? ` (${mascot(g.favorite === 'home' ? g.home_team : g.away_team)} -${g.spread_value})`
+          : '';
+        parts.push('');
+        parts.push(`${(SLOT_WORD[g.slot_name] || g.slot_name).toUpperCase()}: ${mascot(g.away_team)} at ${mascot(g.home_team)}${line}`);
+        for (const m of (ms || []).filter(x => x.slot_name === g.slot_name)) {
+          const picker = nameOf[m.picker_id] || '?';
+          const foe = nameOf[m.opponent_id] || '?';
+          // Say who has already picked, so nobody is chased twice.
+          const state = m.picked_side ? ' (in)' : '';
+          parts.push(` ${picker} picks vs ${foe}${state}`);
+        }
+      }
+
+      parts.push('');
+      parts.push('Picks stay open until each game kicks off. Miss it and you get the favorite.');
+    }
+
+    // Survivor rides along, since it is the same four men and the same text.
+    const cfb = await activeCfbSeason();
+    if (cfb) {
+      const cw = await cfbCurrentWeek(cfb.id);
+      if (cw && !(await CFBService.isLocked(cfb.id, cw))) {
+        const { data: players } = await supabaseAdmin
+          .from('cfb_players').select('id, display_name')
+          .eq('season_id', cfb.id).eq('status', 'alive');
+        const { data: picks } = await supabaseAdmin
+          .from('cfb_picks').select('player_id')
+          .eq('season_id', cfb.id).eq('pool_week', cw);
+        const picked = new Set((picks || []).map(p => p.player_id));
+        const owe = (players || [])
+          .filter(p => !picked.has(p.id) && !mine.has(p.id))
+          .map(p => p.display_name);
+        const lock = await CFBService.lockTime(cfb.id, cw);
+        parts.push('');
+        parts.push(owe.length
+          ? `Survivor week ${cw} locks ${etLabel(lock)} ET. Waiting on ${andList(owe)}.`
+          : `Survivor week ${cw} locks ${etLabel(lock)} ET. Everyone is in.`);
+      }
+    }
+
+    if (!parts.length) return res.json({ text: '', week: null });
+
+    parts.push('');
+    parts.push('barrysbets.net');
+    res.json({ text: plain(parts.join('\n')), week });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
