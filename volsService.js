@@ -37,6 +37,38 @@ const SOURCES = [
   { key: 'volswire', name: 'Vols Wire',         url: 'https://volswire.usatoday.com/feed/',          verified: false },
   { key: 'sds',      name: 'Saturday Down South', url: 'https://www.saturdaydownsouth.com/feed/', filter: true, verified: false },
   { key: 'on3',      name: 'On3 Tennessee',     url: 'https://www.on3.com/teams/tennessee-volunteers/feed/', verified: false },
+  { key: 'outkick',  name: 'OutKick',           url: 'https://www.outkick.com/feed/', filter: true,  verified: false },
+];
+
+// ── video ────────────────────────────────────────────────────
+// YouTube's public RSS feed is GONE. Channel pages still advertise
+// /feeds/videos.xml?channel_id=... in a <link rel=alternate>, and it still
+// 404s — checked Sep 22 2026 against both channels below with a clean
+// same-origin request. So video needs the official Data API.
+//
+// The key is optional on purpose. Without one these channels appear as
+// link-outs, which is worse than thumbnails but better than a feature that
+// silently shows nothing. Set YOUTUBE_API_KEY in Railway to switch it on.
+//
+// Quota note: playlistItems costs 1 unit per call against a 10,000/day free
+// allowance. The search endpoint costs 100 and is not needed — a channel's
+// uploads playlist id is just its channel id with UC swapped for UU.
+const YT_KEY = process.env.YOUTUBE_API_KEY || '';
+
+const CHANNELS = [
+  { key: 'pate', name: 'Pate State', handle: '@JoshPateCFB',
+    id: 'UCg-q_MDeWQrjizr1VPLEpYg' },
+  { key: 'outkicktv', name: 'OutKick', handle: '@OutKick',
+    id: 'UCw66uyR1uMkn8rxLilWoFUA', filter: true },
+];
+
+// Twitter cannot be read without paying — see the note at the top — so
+// these are one-tap links to the feeds themselves. Correct or extend the
+// list freely; a wrong handle here is a dead link, not an error.
+const X_FOLLOW = [
+  { name: 'Clay Travis', handle: 'ClayTravis' },
+  { name: 'Josh Pate',   handle: 'JoshPateCFB' },
+  { name: 'Vols on X',   search: 'Tennessee Vols football' },
 ];
 
 // ── a small, tolerant feed parser ────────────────────────────
@@ -87,6 +119,66 @@ function parseFeed(xml) {
   }).filter(x => x.title && x.url);
 }
 
+// Data API shape. The thumbnail is derived from the video id rather than
+// read out of the payload — same URL YouTube's own share and embed use, and
+// it survives the snippet arriving without a thumbnails block.
+function parseYouTubeApi(payload) {
+  return (payload.items || []).map(it => {
+    const sn = it.snippet || {};
+    const vid = (sn.resourceId && sn.resourceId.videoId) || null;
+    if (!vid || sn.title === 'Private video' || sn.title === 'Deleted video') return null;
+    const t = sn.publishedAt ? new Date(sn.publishedAt) : null;
+    return {
+      title: strip(sn.title),
+      url: `https://www.youtube.com/watch?v=${vid}`,
+      published_at: t && !isNaN(t) ? t.toISOString() : null,
+      summary: '',
+      video_id: vid,
+      thumbnail: `https://i.ytimg.com/vi/${vid}/mqdefault.jpg`,
+    };
+  }).filter(Boolean);
+}
+
+// Kept for the day YouTube brings the feed back, and because it is the only
+// parser that can read a channel feed without a key.
+function parseYouTube(xml) {
+  const blocks = xml.match(/<entry(?:\s[^>]*)?>[\s\S]*?<\/entry>/gi) || [];
+  return blocks.map(b => {
+    const vid = (b.match(/<yt:videoId>([\w-]+)<\/yt:videoId>/) || [])[1]
+      || (b.match(/watch\?v=([\w-]+)/) || [])[1];
+    if (!vid) return null;
+    const when = tag(b, 'published') || tag(b, 'updated');
+    const t = when ? new Date(when) : null;
+    return {
+      title: tag(b, 'title'),
+      url: `https://www.youtube.com/watch?v=${vid}`,
+      published_at: t && !isNaN(t) ? t.toISOString() : null,
+      summary: '',
+      video_id: vid,
+      thumbnail: `https://i.ytimg.com/vi/${vid}/mqdefault.jpg`,
+    };
+  }).filter(x => x && x.title);
+}
+
+// A handle resolves to a channel id once and is then remembered for a day.
+const channelIds = new Map();
+
+async function resolveChannel(handle) {
+  const hit = channelIds.get(handle);
+  if (hit && Date.now() - hit.at < 24 * 3600 * 1000) return hit.id;
+
+  const res = await axios.get(`https://www.youtube.com/${handle}`, {
+    timeout: 10000,
+    headers: { 'User-Agent': UA, Accept: 'text/html' },
+    responseType: 'text',
+    maxContentLength: 8 * 1024 * 1024,
+  });
+  const m = String(res.data).match(/"(?:channelId|externalId)":"(UC[\w-]{20,26})"/);
+  if (!m) throw new Error('no channel id in page');
+  channelIds.set(handle, { id: m[1], at: Date.now() });
+  return m[1];
+}
+
 function parseEspn(payload) {
   return (payload.articles || []).map(a => ({
     title: a.headline || '',
@@ -104,23 +196,39 @@ function parseEspn(payload) {
 const TTL_MS = 15 * 60 * 1000;
 const cache = new Map();   // key -> { at, stories, error }
 
+const UA = 'BarryBets/1.0 (+https://www.barrysbets.net)';
+
 async function loadSource(src) {
   const hit = cache.get(src.key);
   if (hit && Date.now() - hit.at < TTL_MS) return { ...hit, cached: true };
 
   try {
-    const res = await axios.get(src.url, {
+    let url = src.url;
+    if (src.channel) {
+      if (!YT_KEY) throw new Error('no YOUTUBE_API_KEY set');
+      const id = src.channel.id || await resolveChannel(src.channel.handle);
+      const uploads = 'UU' + id.slice(2);
+      url = 'https://www.googleapis.com/youtube/v3/playlistItems'
+          + `?part=snippet&maxResults=10&playlistId=${uploads}&key=${YT_KEY}`;
+    }
+
+    const res = await axios.get(url, {
       timeout: 10000,
       // Some hosts refuse a request with no User-Agent at all.
-      headers: { 'User-Agent': 'BarryBets/1.0 (+https://www.barrysbets.net)', Accept: '*/*' },
+      headers: { 'User-Agent': UA, Accept: '*/*' },
       // Feeds are text; stop axios guessing.
-      responseType: src.espn ? 'json' : 'text',
+      responseType: (src.espn || src.channel) ? 'json' : 'text',
       maxContentLength: 5 * 1024 * 1024,
     });
 
-    let stories = src.espn ? parseEspn(res.data) : parseFeed(String(res.data));
+    let stories = src.espn ? parseEspn(res.data)
+      : src.channel ? parseYouTubeApi(res.data)
+      : parseFeed(String(res.data));
     if (src.filter) stories = stories.filter(s => VOLS.test(s.title + ' ' + s.summary));
-    stories = stories.map(s => ({ ...s, source: src.name, source_key: src.key }));
+    stories = stories.map(s => ({
+      ...s, source: src.name, source_key: src.key,
+      kind: src.channel ? 'video' : 'article',
+    }));
 
     const fresh = { at: Date.now(), stories, error: null };
     cache.set(src.key, fresh);
@@ -136,7 +244,14 @@ async function loadSource(src) {
 }
 
 async function stories({ limit = 40 } = {}) {
-  const results = await Promise.all(SOURCES.map(async s => ({ src: s, got: await loadSource(s) })));
+  // Video sources only join the run when there is a key to call the API
+  // with. Otherwise they would each report the same failure on every load.
+  const active = YT_KEY
+    ? SOURCES.concat(CHANNELS.map(c => ({
+        key: c.key, name: c.name, channel: c, filter: c.filter, verified: false })))
+    : SOURCES;
+
+  const results = await Promise.all(active.map(async s => ({ src: s, got: await loadSource(s) })));
 
   const seen = new Set();
   const all = [];
@@ -158,8 +273,23 @@ async function stories({ limit = 40 } = {}) {
 
   return {
     stories: all.slice(0, limit),
+    // Channels to watch. Thumbnails need the API key; without it these are
+    // still one tap away, which is the honest version of the feature.
+    watch: CHANNELS.map(c => ({
+      name: c.name,
+      url: `https://www.youtube.com/${c.handle}`,
+      inline: !!YT_KEY,
+    })),
+    video_enabled: !!YT_KEY,
+    follow: X_FOLLOW.map(f => ({
+      name: f.name,
+      url: f.search
+        ? `https://x.com/search?q=${encodeURIComponent(f.search)}&f=live`
+        : `https://x.com/${f.handle}`,
+    })),
     sources: results.map(({ src, got }) => ({
       name: src.name,
+      kind: src.youtube ? 'video' : 'article',
       count: got.stories.length,
       ok: !got.error,
       error: got.error || null,
@@ -170,7 +300,9 @@ async function stories({ limit = 40 } = {}) {
 // What is actually working. Worth having: a feed that quietly dies just
 // looks like a slow news week.
 async function health() {
-  const results = await Promise.all(SOURCES.map(async s => {
+  const all = SOURCES.concat(CHANNELS.map(c => ({
+    key: c.key, name: c.name + ' (video)', channel: c, filter: c.filter, verified: false })));
+  const results = await Promise.all(all.map(async s => {
     cache.delete(s.key);                       // force a real fetch
     const got = await loadSource(s);
     return {
@@ -181,7 +313,14 @@ async function health() {
       newest: got.stories[0] ? got.stories[0].title.slice(0, 80) : null,
     };
   }));
-  return { checked_at: new Date().toISOString(), sources: results };
+  return {
+    checked_at: new Date().toISOString(),
+    youtube_key_set: !!YT_KEY,
+    sources: results,
+  };
 }
 
-module.exports = { stories, health, SOURCES, parseFeed, parseEspn, strip };
+module.exports = {
+  stories, health, SOURCES, CHANNELS, X_FOLLOW,
+  parseFeed, parseEspn, parseYouTube, parseYouTubeApi, strip,
+};
