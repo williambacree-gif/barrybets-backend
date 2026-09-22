@@ -12,6 +12,7 @@ const mnfRoutes = require('./mnfRoutes');
 const MNFService = require('./mnfService');
 const cfbRoutes = require('./cfbRoutes');
 const authRoutes = require('./authRoutes');
+const commishRoutes = require('./commishRoutes');
 const CFBService = require('./cfbService');
 const { supabaseAdmin } = require('./supabase');
 
@@ -41,6 +42,10 @@ app.use('/api/masters', mastersRoutes);
 app.use('/api/mnf', mnfRoutes);
 app.use('/api/cfb', cfbRoutes);
 app.use('/api/auth', authRoutes);
+// The commissioner panel. Gated by the signed-in user, not a shared
+// secret, so there is no token to paste into a URL and no way to be told
+// "Forbidden" by a page that looks like it worked.
+app.use('/api/commish', commishRoutes);
 
 app.get('/api/health', (req, res) => {
     res.json({ status: 'alive', app: 'Barry Bets', timestamp: new Date().toISOString() });

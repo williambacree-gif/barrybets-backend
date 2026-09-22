@@ -12,6 +12,7 @@
 // rather than trusting Supabase to deliver the mail.
 // ═══════════════════════════════════════════════════════════════
 
+const crypto = require('crypto');
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const router = express.Router();
@@ -151,6 +152,66 @@ router.get('/admin-link', async (req, res) => {
       link: link,
       note: 'Send this to him directly. Good for one hour, and only once.',
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// REDEEM A COMMISSIONER-ISSUED RESET LINK
+//
+// Open to signed-out people by necessity — the whole point is that the
+// man cannot get in. So it is rate limited hard, says nothing about which
+// links exist, and the token is matched by hash, never stored in the
+// clear.
+//
+// A link is good for one password and then it is spent, so a text message
+// sitting in someone's history is worth nothing after it has been used.
+// ─────────────────────────────────────────────────────────────
+const redeemLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+router.post('/redeem-reset', redeemLimiter, async (req, res) => {
+  try {
+    const token = String((req.body && req.body.token) || '');
+    const password = String((req.body && req.body.password) || '');
+
+    if (!token) return res.status(400).json({ error: 'That link is missing its code' });
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Pick a password of at least 8 characters' });
+    }
+
+    const hash = crypto.createHash('sha256').update(token).digest('hex');
+    const { data: row } = await supabaseAdmin
+      .from('bb_reset_tokens')
+      .select('id, user_id, email, expires_at, used_at')
+      .eq('token_hash', hash)
+      .maybeSingle();
+
+    // One message for every failure: wrong code, already used, expired.
+    // Distinguishing them would tell a stranger which codes are real.
+    const dead = !row || row.used_at || new Date(row.expires_at) <= new Date();
+    if (dead) {
+      return res.status(400).json({
+        error: 'That link has expired or has already been used. Ask Will for a fresh one.',
+      });
+    }
+
+    const { error: uErr } = await supabaseAdmin.auth.admin
+      .updateUserById(row.user_id, { password });
+    if (uErr) throw uErr;
+
+    // Spend it only after the password actually changed, so a failure here
+    // does not burn the link and leave him locked out twice.
+    await supabaseAdmin.from('bb_reset_tokens')
+      .update({ used_at: new Date().toISOString() }).eq('id', row.id);
+
+    console.log(`[Reset] Commissioner link redeemed for ${row.email}`);
+    res.json({ ok: true, email: row.email });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
