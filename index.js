@@ -14,6 +14,7 @@ const cfbRoutes = require('./cfbRoutes');
 const authRoutes = require('./authRoutes');
 const commishRoutes = require('./commishRoutes');
 const volsRoutes = require('./volsRoutes');
+const gasRoutes = require('./gasRoutes');
 const CFBService = require('./cfbService');
 const { supabaseAdmin } = require('./supabase');
 
@@ -50,6 +51,7 @@ app.use('/api/commish', commishRoutes);
 // Vols news. All four players are Tennessee fans, and a reason to open the
 // app on a Tuesday is worth more than another feature inside the pools.
 app.use('/api/vols', volsRoutes);
+app.use('/api/gas', gasRoutes);
 
 app.get('/api/health', (req, res) => {
     res.json({ status: 'alive', app: 'Barry Bets', timestamp: new Date().toISOString() });
