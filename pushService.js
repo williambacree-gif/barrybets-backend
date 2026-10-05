@@ -244,16 +244,49 @@ async function nflReminders(now) {
   return out.length ? out : null;
 }
 
+// ── the 1788s rides along ────────────────────────────────────
+// Vercel's free cron fires once a day inside an hour-wide window, which
+// cannot do "three hours before kickoff". This box runs a real scheduler,
+// so it pokes the 1788s on the same quarter-hourly beat. Only a trigger
+// crosses the line — each app keeps its own service key in its own project.
+//
+// With no token set this does nothing at all, quietly, so the sweep here
+// is never held up by the other app's configuration.
+const S1788_URL = process.env.S1788_PUSH_URL || 'https://www.the1788s.org/api/push-send';
+const S1788_TOKEN = process.env.S1788_PUSH_TOKEN || '';
+
+async function nudge1788s() {
+  if (!S1788_TOKEN) return null;
+  try {
+    const res = await fetch(S1788_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-admin-token': S1788_TOKEN },
+      body: '{}',
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error(`[Push/1788s] ${res.status}: ${body.error || 'no detail'}`);
+      return { error: body.error || res.status };
+    }
+    if (body.sent) console.log(`[Push/1788s] ${body.nudge} week ${body.week}: ${body.sent} sent`);
+    return body;
+  } catch (err) {
+    console.error(`[Push/1788s] unreachable: ${err.message}`);
+    return { error: err.message };
+  }
+}
+
 async function runReminders() {
   const now = Date.now();
   try {
     const a = await cfbReminders(now);
     const b = await nflReminders(now);
-    return { cfb: a, nfl: b };
+    const c = await nudge1788s();
+    return { cfb: a, nfl: b, s1788: c };
   } catch (err) {
     console.error(`[Push] reminder run failed: ${err.message}`);
     return { error: err.message };
   }
 }
 
-module.exports = { publicKey, sendToUsers, sendOnce, runReminders, dueNow, windowFor };
+module.exports = { publicKey, sendToUsers, sendOnce, runReminders, nudge1788s, dueNow, windowFor };
