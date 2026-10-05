@@ -15,6 +15,8 @@ const authRoutes = require('./authRoutes');
 const commishRoutes = require('./commishRoutes');
 const volsRoutes = require('./volsRoutes');
 const gasRoutes = require('./gasRoutes');
+const pushRoutes = require('./pushRoutes');
+const PushService = require('./pushService');
 const CFBService = require('./cfbService');
 const { supabaseAdmin } = require('./supabase');
 
@@ -52,6 +54,7 @@ app.use('/api/commish', commishRoutes);
 // app on a Tuesday is worth more than another feature inside the pools.
 app.use('/api/vols', volsRoutes);
 app.use('/api/gas', gasRoutes);
+app.use('/api/push', pushRoutes);
 
 app.get('/api/health', (req, res) => {
     res.json({ status: 'alive', app: 'Barry Bets', timestamp: new Date().toISOString() });
@@ -202,6 +205,18 @@ cron.schedule('0 9 * * *', async () => {
             console.log('[MNF Catch-up] Caught something the nightly runs missed:', JSON.stringify(r));
         }
     } catch (err) { console.error('[MNF Catch-up] Failed:', err.message); }
+}, ET);
+
+// ── Pick reminders ───────────────────────────────────────────
+// Two nudges per deadline: one a day out, one three hours out, and only
+// to the men who still owe a pick. Runs every quarter hour so a reminder
+// lands close to its window; bb_push_log's unique key means a tick that
+// finds nothing new sends nothing, and a missed tick sends late rather
+// than never.
+cron.schedule('*/15 * * * *', async () => {
+    try {
+        await PushService.runReminders();
+    } catch (err) { console.error('[Push] sweep failed:', err.message); }
 }, ET);
 
 // No frozen spread means no week. autoAssignMissingPicks skips games with
