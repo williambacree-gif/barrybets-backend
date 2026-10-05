@@ -584,4 +584,231 @@ router.post('/void-week', actionLimiter, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// SURVIVOR OVERRIDES
+//
+// A man texts his pick after the board locks but before his own game
+// kicks. Until now that meant raw SQL at a desk. These three routes put
+// the ruling in the commissioner's hand, and write down what he did.
+//
+// Every override lands in bb_overrides with a reason. That table is only
+// reachable with the service key, so the log is the commissioner's own
+// record — the players see an ordinary pick.
+// ═══════════════════════════════════════════════════════════════
+
+async function logOverride(req, seasonId, playerId, week, action, detail, reason) {
+  const { error } = await supabaseAdmin.from('bb_overrides').insert({
+    season_id: seasonId,
+    player_id: playerId,
+    pool_week: week == null ? null : Number(week),
+    action,
+    detail: detail || {},
+    reason: (reason || '').trim() || null,
+    acted_by: req.user.id,
+  });
+  // A failed log must not hide a successful write, but it should be loud.
+  if (error) console.error(`[Commish] override log failed: ${error.message}`);
+}
+
+// Everything the override screen needs for one week, in one call.
+router.get('/pick-board', async (req, res) => {
+  try {
+    const cfb = await activeCfbSeason();
+    if (!cfb) return res.status(404).json({ error: 'No active survivor season' });
+
+    const [{ data: games }, { data: players }, { data: picks }, { data: log }] = await Promise.all([
+      supabaseAdmin.from('cfb_games').select('*').eq('season_id', cfb.id).order('kickoff_at'),
+      supabaseAdmin.from('cfb_players').select('*').eq('season_id', cfb.id),
+      supabaseAdmin.from('cfb_picks').select('*').eq('season_id', cfb.id),
+      supabaseAdmin.from('bb_overrides').select('*').eq('season_id', cfb.id)
+        .order('acted_at', { ascending: false }).limit(50),
+    ]);
+
+    const all = games || [];
+    const weeks = [...new Set(all.map(g => g.pool_week))].filter(w => w > 0).sort((a, b) => a - b);
+
+    // Land on the first week that still has a game to play.
+    let week = Number(req.query.pool_week);
+    if (!weeks.includes(week)) {
+      week = weeks.find(w => all.some(g => g.pool_week === w && g.status !== 'final'))
+        || weeks[weeks.length - 1] || 1;
+    }
+
+    const board = all.filter(g => g.pool_week === week);
+    const lock = board.reduce((min, g) => (!min || g.kickoff_at < min ? g.kickoff_at : min), null);
+
+    const roster = (players || []).map(p => {
+      const mine = (picks || []).filter(k => k.player_id === p.id);
+      const thisWeek = mine.find(k => k.pool_week === week) || null;
+      return {
+        id: p.id,
+        name: p.display_name,
+        status: p.status,
+        eliminated_week: p.eliminated_week,
+        used_team_ids: mine.map(k => k.picked_team_id).filter(Boolean),
+        pick: thisWeek && {
+          team: thisWeek.picked_team, team_id: thisWeek.picked_team_id,
+          side: thisWeek.picked_side, result: thisWeek.result,
+          auto_assigned: !!thisWeek.auto_assigned,
+        },
+      };
+    }).sort((a, b) => a.name.localeCompare(b.name));
+
+    res.json({
+      week, weeks,
+      lock_at: lock,
+      lock_label: etLabel(lock),
+      locked: lock ? new Date(lock).getTime() <= Date.now() : false,
+      board: board.map(g => ({
+        id: g.id, away: g.away_team, home: g.home_team,
+        away_rank: g.away_rank, home_rank: g.home_rank,
+        away_team_id: g.away_team_id, home_team_id: g.home_team_id,
+        kickoff_at: g.kickoff_at, kickoff_label: etLabel(g.kickoff_at),
+        status: g.status, away_score: g.away_score, home_score: g.home_score,
+        winner_side: g.winner_side,
+      })),
+      roster,
+      missing: roster.filter(p => p.status === 'alive' && !p.pick).map(p => p.name),
+      log: (log || []).map(o => ({
+        id: o.id, action: o.action, pool_week: o.pool_week,
+        detail: o.detail, reason: o.reason, acted_at: o.acted_at,
+        acted_label: etLabel(o.acted_at),
+      })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Set or replace a man's pick, lock or no lock.
+router.post('/set-pick', actionLimiter, async (req, res) => {
+  try {
+    const { player_id, game_id, side, reason } = req.body || {};
+    if (!player_id || !game_id || (side !== 'home' && side !== 'away')) {
+      return res.status(400).json({ error: 'Need a player, a game and a side' });
+    }
+
+    const cfb = await activeCfbSeason();
+    if (!cfb) return res.status(404).json({ error: 'No active survivor season' });
+
+    const { data: game } = await supabaseAdmin
+      .from('cfb_games').select('*').eq('id', game_id).maybeSingle();
+    if (!game || game.season_id !== cfb.id) return res.status(400).json({ error: 'That game is not in this season' });
+
+    const { data: player } = await supabaseAdmin
+      .from('cfb_players').select('*').eq('id', player_id).maybeSingle();
+    if (!player || player.season_id !== cfb.id) return res.status(400).json({ error: 'That player is not in this season' });
+
+    const week = game.pool_week;
+    const teamId = side === 'home' ? game.home_team_id : game.away_team_id;
+    const teamName = side === 'home' ? game.home_team : game.away_team;
+
+    // One and done still applies. The row we are about to replace in THIS
+    // week does not count against him.
+    const { data: used } = await supabaseAdmin
+      .from('cfb_picks').select('pool_week')
+      .eq('season_id', cfb.id).eq('player_id', player_id).eq('picked_team_id', teamId);
+    const clash = (used || []).find(u => u.pool_week !== week);
+    if (clash) {
+      return res.status(400).json({ error: `${player.display_name} already used ${teamName} in week ${clash.pool_week}` });
+    }
+
+    const { data: existing } = await supabaseAdmin
+      .from('cfb_picks').select('*')
+      .eq('season_id', cfb.id).eq('pool_week', week).eq('player_id', player_id).maybeSingle();
+
+    const settled = game.status === 'final' && game.winner_side;
+    const result = settled ? (game.winner_side === side ? 'win' : 'loss') : 'pending';
+
+    const payload = {
+      season_id: cfb.id, pool_week: week, player_id, game_id: game.id,
+      picked_side: side, picked_team: teamName, picked_team_id: teamId,
+      picked_at: new Date().toISOString(), result, auto_assigned: false,
+    };
+
+    if (existing) {
+      const { error } = await supabaseAdmin.from('cfb_picks').update(payload).eq('id', existing.id);
+      if (error) throw error;
+    } else {
+      const { error } = await supabaseAdmin.from('cfb_picks').insert(payload);
+      if (error) throw error;
+    }
+
+    // Carry the consequence for THIS week and no further: a losing pick in
+    // week 6 must not revive a man who went out in week 3.
+    let status = 'status unchanged';
+    if (result === 'win' && player.status === 'eliminated' && player.eliminated_week === week) {
+      await supabaseAdmin.from('cfb_players')
+        .update({ status: 'alive', eliminated_week: null }).eq('id', player_id);
+      status = 'back in';
+    } else if (result === 'loss' && player.status === 'alive') {
+      await supabaseAdmin.from('cfb_players')
+        .update({ status: 'eliminated', eliminated_week: week }).eq('id', player_id);
+      status = `out in week ${week}`;
+    }
+
+    await logOverride(req, cfb.id, player_id, week, 'set_pick', {
+      player: player.display_name, team: teamName, side,
+      game: `${game.away_team} at ${game.home_team}`,
+      replaced: existing ? { team: existing.picked_team, result: existing.result } : null,
+      result, status,
+    }, reason);
+
+    console.log(`[Commish] ${player.display_name} set to ${teamName} in week ${week} (${result}, ${status})`);
+    res.json({
+      ok: true, week, team: teamName, result, status,
+      message: `${player.display_name} is on ${teamName} for week ${week}` +
+        (settled ? ` — a ${result}, ${status}.` : '.'),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Put a man back in.
+router.post('/reinstate', actionLimiter, async (req, res) => {
+  try {
+    const { player_id, reason } = req.body || {};
+    const cfb = await activeCfbSeason();
+    if (!cfb) return res.status(404).json({ error: 'No active survivor season' });
+
+    const { data: player } = await supabaseAdmin
+      .from('cfb_players').select('*').eq('id', player_id).maybeSingle();
+    if (!player || player.season_id !== cfb.id) return res.status(400).json({ error: 'That player is not in this season' });
+    if (player.status === 'alive') return res.status(400).json({ error: `${player.display_name} is already in` });
+
+    await supabaseAdmin.from('cfb_players')
+      .update({ status: 'alive', eliminated_week: null }).eq('id', player_id);
+
+    await logOverride(req, cfb.id, player_id, player.eliminated_week, 'reinstate', {
+      player: player.display_name, was_eliminated_week: player.eliminated_week,
+    }, reason);
+
+    console.log(`[Commish] ${player.display_name} reinstated`);
+    res.json({ ok: true, message: `${player.display_name} is back in.` });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Take a man out.
+router.post('/eliminate', actionLimiter, async (req, res) => {
+  try {
+    const { player_id, pool_week, reason } = req.body || {};
+    const week = Number(pool_week);
+    if (!week) return res.status(400).json({ error: 'pool_week is required' });
+
+    const cfb = await activeCfbSeason();
+    if (!cfb) return res.status(404).json({ error: 'No active survivor season' });
+
+    const { data: player } = await supabaseAdmin
+      .from('cfb_players').select('*').eq('id', player_id).maybeSingle();
+    if (!player || player.season_id !== cfb.id) return res.status(400).json({ error: 'That player is not in this season' });
+
+    await supabaseAdmin.from('cfb_players')
+      .update({ status: 'eliminated', eliminated_week: week }).eq('id', player_id);
+
+    await logOverride(req, cfb.id, player_id, week, 'eliminate', {
+      player: player.display_name, was_status: player.status,
+    }, reason);
+
+    console.log(`[Commish] ${player.display_name} eliminated in week ${week}`);
+    res.json({ ok: true, message: `${player.display_name} is out in week ${week}.` });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 module.exports = router;
